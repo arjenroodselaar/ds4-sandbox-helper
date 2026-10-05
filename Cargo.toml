@@ -1,0 +1,17 @@
+[package]
+name = "ds4-sandbox-helper"
+version = "0.1.0"
+edition = "2024"
+description = "Sandbox-side tool runner for ds4-agent --sandbox: framed request/response protocol plus the read/write/edit/search/list/bash tools"
+license = "MIT"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "io-std", "time", "sync", "fs"] }
+serde_json = "1"
+regex = "1"
+libc = "0.2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
