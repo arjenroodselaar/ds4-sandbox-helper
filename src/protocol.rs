@@ -9,7 +9,8 @@
 //! boolean `ok` cannot be told from a successful one, so both end the session
 //! rather than being guessed at.
 
-use serde_json::{Value, json};
+use serde_json::Value;
+use serde_json::json;
 use std::collections::BTreeMap;
 
 /// The most lines a request may ask a bare `read` or `more` to return.  It is the

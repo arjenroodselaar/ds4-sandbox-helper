@@ -14,11 +14,21 @@
 
 use std::io::ErrorKind;
 
-use tokio::io::{AsyncRead, AsyncWrite, BufReader};
+use tokio::io::AsyncRead;
+use tokio::io::AsyncWrite;
+use tokio::io::BufReader;
 
-use crate::protocol::{self, notice, response_error, response_ok};
-use crate::tools::{self, Config, Session};
-use crate::wire::{self, Frame, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES};
+use crate::protocol;
+use crate::protocol::notice;
+use crate::protocol::response_error;
+use crate::protocol::response_ok;
+use crate::tools;
+use crate::tools::Config;
+use crate::tools::Session;
+use crate::wire;
+use crate::wire::Frame;
+use crate::wire::MAX_REQUEST_BYTES;
+use crate::wire::MAX_RESPONSE_BYTES;
 
 /// Why the loop stopped.  The exit code and the stderr line both come from this.
 pub enum Outcome {

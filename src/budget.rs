@@ -7,7 +7,8 @@
 //! cannot put a bigger observation in front of the model than the agent would have
 //! written itself.
 
-use std::fmt::{self, Write};
+use std::fmt;
+use std::fmt::Write;
 
 /// The agent truncates sandbox answers at the same size; going over it only buys a
 /// second truncation with a different note.

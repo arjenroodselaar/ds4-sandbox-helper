@@ -14,9 +14,12 @@
 use std::fmt;
 use std::io;
 
-use tokio::io::{
-    AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt,
-};
+use tokio::io::AsyncBufRead;
+use tokio::io::AsyncBufReadExt;
+use tokio::io::AsyncRead;
+use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWrite;
+use tokio::io::AsyncWriteExt;
 
 /// Longest accepted header, newline included.  A longer run of digits is not a
 /// frame; it is a program printing something other than frames.

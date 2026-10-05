@@ -8,7 +8,8 @@
 //! nothing, because the model would treat an incomplete answer as a complete one.
 
 use std::fmt::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 use tokio::io::AsyncBufReadExt;
 
 /// A recursive `async fn` cannot return `impl Future` (it would need itself by
@@ -16,7 +17,8 @@ use tokio::io::AsyncBufReadExt;
 /// directory, which is nothing next to reading the files inside it.
 type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 
-use regex::{Regex, RegexBuilder};
+use regex::Regex;
+use regex::RegexBuilder;
 
 use crate::budget::Budget;
 use crate::files;

@@ -15,9 +15,11 @@
 use std::fmt::Write as _;
 use std::io::SeekFrom;
 
-use tokio::io::{AsyncBufReadExt, AsyncSeekExt};
+use tokio::io::AsyncBufReadExt;
+use tokio::io::AsyncSeekExt;
 
-use crate::budget::{MAX_TOOL_BYTES, NOTE_MARGIN};
+use crate::budget::MAX_TOOL_BYTES;
+use crate::budget::NOTE_MARGIN;
 use crate::files;
 
 /// Room the body may use before the read stops.  The header and the resume note

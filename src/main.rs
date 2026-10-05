@@ -18,7 +18,8 @@ mod wire;
 
 use std::process::ExitCode;
 
-use clap::{ArgAction, Parser};
+use clap::ArgAction;
+use clap::Parser;
 use tools::Config;
 
 // The command line, which is also what --help prints.  The doc comment on the struct
@@ -131,9 +132,11 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, MutexGuard};
+    use std::sync::Mutex;
+    use std::sync::MutexGuard;
 
-    use clap::{CommandFactory, error::ErrorKind};
+    use clap::CommandFactory;
+    use clap::error::ErrorKind;
 
     /// Parsing looks at the environment as well as the command line, and tests run in
     /// parallel against one copy of the environment, so every test here takes this

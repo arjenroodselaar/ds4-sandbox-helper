@@ -6,10 +6,18 @@
 //! plain exclusive file is refused instead of followed.  A symlink in the way of a
 //! write is therefore an error rather than a surprise somewhere else on disk.
 
-use std::fs::{File, Metadata, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::fs::File;
+use std::fs::Metadata;
+use std::fs::OpenOptions;
+use std::io;
+use std::io::Read;
+use std::io::Seek;
+use std::io::SeekFrom;
+use std::io::Write;
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use tempfile::NamedTempFile;

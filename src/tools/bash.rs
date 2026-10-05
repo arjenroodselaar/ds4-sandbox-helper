@@ -17,17 +17,21 @@
 use std::fmt::Write;
 use std::io::SeekFrom;
 use std::os::unix::process::ExitStatusExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 use std::process::Stdio;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use std::time::Instant;
 
 use tempfile::NamedTempFile;
 use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::io::AsyncReadExt;
+use tokio::io::AsyncSeekExt;
 use tokio::process::Command;
 use tokio::sync::watch;
 
-use crate::budget::{Budget, MAX_TOOL_BYTES};
+use crate::budget::Budget;
+use crate::budget::MAX_TOOL_BYTES;
 use crate::files;
 use crate::protocol::Request;
 
