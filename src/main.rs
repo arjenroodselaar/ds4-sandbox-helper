@@ -16,6 +16,8 @@ mod server;
 mod tools;
 mod wire;
 
+use std::path::Path;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::ArgAction;
@@ -69,6 +71,20 @@ struct Args {
         value_parser = clap::builder::BoolishValueParser::new(),
     )]
     edit_upto: bool,
+
+    /// Work in DIR instead of the directory this was started in
+    ///
+    /// The agent's own --chdir, for whoever starts this helper directly: every
+    /// relative path in a request, and the directory `bash` commands begin in, is
+    /// resolved there.  It happens before the first frame is read, so there is no
+    /// moment when the answer to a relative path could come from somewhere else.
+    ///
+    /// There is no environment variable for it, unlike the two above.  A directory
+    /// inherited through the environment would be entered twice over for a helper the
+    /// agent had already moved, and a relative one would then mean somewhere else
+    /// entirely.
+    #[arg(long, value_name = "DIR")]
+    chdir: Option<PathBuf>,
 }
 
 impl Args {
@@ -98,10 +114,40 @@ fn after_help() -> String {
     )
 }
 
+/// Moves the process into `dir`, checked and complained about in the same two steps
+/// and the same words as `ds4-agent --chdir`: a launch that ended up somewhere else
+/// would answer every later question about the wrong files, and nothing in a frame
+/// would show it.  A directory the person named is not there is a mistake in the
+/// command line, so it leaves with status 1 and no frame on stdout.
+fn enter(dir: &Path) -> Result<(), String> {
+    match std::fs::metadata(dir) {
+        Err(err) => Err(format!(
+            "invalid working directory {}: {}",
+            dir.display(),
+            files::err_message(&err)
+        )),
+        Ok(meta) if !meta.is_dir() => Err(format!("{} is not a directory", dir.display())),
+        Ok(_) => std::env::set_current_dir(dir).map_err(|err| {
+            format!(
+                "failed to chdir to {}: {}",
+                dir.display(),
+                files::err_message(&err)
+            )
+        }),
+    }
+}
+
 fn main() -> ExitCode {
     // Help and version print and exit successfully; an argument that cannot be read
     // prints a usage line and exits 2, which is the status the help text promises.
-    let config = Args::parse().config();
+    let args = Args::parse();
+    if let Some(dir) = &args.chdir
+        && let Err(message) = enter(dir)
+    {
+        eprintln!("ds4-sandbox-helper: {message}");
+        return ExitCode::FAILURE;
+    }
+    let config = args.config();
 
     // enable_all: the tools wait on pipes, on child processes, and on timers, and a
     // runtime that has not enabled an driver refuses to wait on any of them.
@@ -150,9 +196,12 @@ mod tests {
     ///
     /// The caller holds `ENV`, which is why it is passed in: holding it is the proof
     /// that nothing else in this process is reading the environment concurrently.
-    fn config_from(list: &[&str], _env: &MutexGuard<'_, ()>) -> Result<Config, clap::Error> {
+    fn args_from(list: &[&str], _env: &MutexGuard<'_, ()>) -> Result<Args, clap::Error> {
         Args::try_parse_from(std::iter::once(env!("CARGO_PKG_NAME")).chain(list.iter().copied()))
-            .map(|args| args.config())
+    }
+
+    fn config_from(list: &[&str], env: &MutexGuard<'_, ()>) -> Result<Config, clap::Error> {
+        args_from(list, env).map(|args| args.config())
     }
 
     /// Runs `body` with neither variable set, and puts back what was there.  What the
@@ -179,9 +228,28 @@ mod tests {
     #[test]
     fn the_defaults_are_the_conservative_ones() {
         let env = ENV.lock().unwrap();
-        let config = unsafe { without_env(|| config_from(&[], &env)) }.unwrap();
-        assert_eq!(config.read_lines, 120);
-        assert!(!config.edit_upto);
+        let args = unsafe { without_env(|| args_from(&[], &env)) }.unwrap();
+        assert_eq!(args.read_lines, 120);
+        assert!(!args.edit_upto);
+        // No directory asked for means the one the process was started in, which is
+        // the only answer that does not need this program to have an opinion.
+        assert_eq!(args.chdir, None);
+    }
+
+    #[test]
+    fn a_directory_can_be_asked_for_in_either_spelling() {
+        let env = ENV.lock().unwrap();
+        for spelling in [&["--chdir", "/src"][..], &["--chdir=/src"][..]] {
+            let args = args_from(spelling, &env).unwrap();
+            assert_eq!(
+                args.chdir.as_deref(),
+                Some(Path::new("/src")),
+                "{spelling:?}"
+            );
+        }
+        // A flag that names no directory is a mistake in the command line, not a
+        // request to stay where the launcher happened to be.
+        assert!(args_from(&["--chdir"], &env).is_err());
     }
 
     #[test]
@@ -242,6 +310,36 @@ mod tests {
         }
     }
 
+    /// The two complaints `ds4-agent --chdir` makes, in its words: a person reading
+    /// them has to be able to tell "not there" from "not a directory".
+    ///
+    /// Only the failures are tried here.  Succeeding would move the working directory
+    /// of this whole test process, and the other tests in it are running in parallel
+    /// with paths of their own; the success path is what the end-to-end test does in a
+    /// process of its own.
+    #[test]
+    fn a_directory_that_cannot_be_worked_in_is_named_before_anything_runs() {
+        let scratch = tempfile::TempDir::with_prefix("ds4-helper-chdir-").unwrap();
+
+        let missing = scratch.path().join("missing");
+        let err = enter(&missing).unwrap_err();
+        assert!(
+            err.starts_with(&format!(
+                "invalid working directory {}: ",
+                missing.display()
+            )),
+            "{err}"
+        );
+        assert!(err.contains("No such file"), "{err}");
+
+        let file = scratch.path().join("a-file");
+        std::fs::write(&file, b"not a directory\n").unwrap();
+        assert_eq!(
+            enter(&file).unwrap_err(),
+            format!("{} is not a directory", file.display())
+        );
+    }
+
     #[test]
     fn help_and_version_are_not_session_starts() {
         let _env = ENV.lock().unwrap();
@@ -261,7 +359,7 @@ mod tests {
     fn the_help_names_the_options_and_the_served_tools() {
         let _env = ENV.lock().unwrap();
         let help = Args::command().render_help().to_string();
-        for expected in ["--read-lines", "--edit-upto", "DS4_EDIT_UPTO"] {
+        for expected in ["--read-lines", "--edit-upto", "--chdir", "DS4_EDIT_UPTO"] {
             assert!(help.contains(expected), "help does not mention {expected}");
         }
         // The after-help is where the tool list lives, and it is built from the

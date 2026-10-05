@@ -24,15 +24,18 @@ ds4-agent --sandbox 'docker run -i --rm -v "$PWD:/w" -w /w helper' …
 
 ## Options
 
-Both also read the matching environment variable, which is easier than quoting them
-through a container's `-e`.  `--help` lists the same two, with their defaults, and a
-value that does not parse — on the command line or in the environment — stops the
-helper with usage on stderr rather than being quietly ignored.
-
 | Option | Env | Default | Why it exists |
 | --- | --- | --- | --- |
 | `--read-lines N` | `DS4_READ_LINES` | `120` | Fallback for how many lines a bare `read` or `more` returns. The agent sends the real number with every request (`limits.read_lines`), because it is the one that knows the model's context size; this is what is used when a request does not say, which in practice means a person at a terminal. |
 | `--edit-upto` | `DS4_EDIT_UPTO` | off | Accepts an `[upto]` marker in `edit`'s `old` text, which selects everything between two anchors. It can delete a great deal at once, so it is opt-in. |
+| `--chdir DIR` | — | the launch directory | Works in `DIR` instead: every relative path in a request, and the directory `bash` starts a command in, resolve there. Done before the first frame is read, so nothing is ever answered from somewhere else. The same flag and the same complaints as `ds4-agent --chdir`. No environment variable: a directory inherited through one would be entered twice over for a helper the agent had already moved, and a relative one would then mean somewhere else entirely. |
+
+The first two also read the matching environment variable, which is easier than quoting
+them through a container's `-e`.  `--help` lists all three with their defaults, and a
+value that does not parse — on the command line or in the environment — stops the helper
+with usage on stderr rather than being quietly ignored.  A `--chdir` that cannot be done
+is a different kind of mistake, and gets the agent's own words for it: `invalid working
+directory …` or `… is not a directory`, on stderr, with status 1 and nothing on stdout.
 
 ## Tools
 

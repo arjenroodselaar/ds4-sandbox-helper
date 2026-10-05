@@ -607,6 +607,69 @@ async fn a_frame_that_is_not_a_json_object_ends_the_session() {
     );
 }
 
+/// `--chdir` is the only thing that says what a relative path means to this helper,
+/// so it has to hold for every tool that is given one.
+#[tokio::test]
+async fn a_relative_path_is_answered_from_the_directory_asked_for_at_start() {
+    let (dir, _dir) = scratch("chdir");
+    let mut helper = Helper::start(&["--chdir", dir.to_str().unwrap()]).await;
+
+    let answer = helper
+        .ok(
+            "write",
+            serde_json::json!({"path": "inside.txt", "content": "one\n"}),
+        )
+        .await;
+    assert!(answer.contains("Wrote 4 bytes"), "{answer}");
+    assert_eq!(std::fs::read(dir.join("inside.txt")).unwrap(), b"one\n");
+
+    let answer = helper
+        .ok("read", serde_json::json!({"path": "inside.txt"}))
+        .await;
+    assert!(answer.contains("one"), "{answer}");
+
+    // A shell started by `bash` begins in the same place, which is the reason the
+    // flag is worth having: no command has to name the root of the session.
+    let answer = helper
+        .ok("bash", serde_json::json!({"command": "cat inside.txt"}))
+        .await;
+    assert!(answer.contains("one"), "{answer}");
+
+    // An absolute path still means what it says: the directory is where relative
+    // ones start, not a wall around the session.
+    let answer = helper
+        .ok("read", serde_json::json!({"path": "/etc/passwd"}))
+        .await;
+    assert!(!answer.trim().is_empty(), "{answer}");
+    helper.finish().await;
+}
+
+/// A directory that cannot be worked in is a mistake in the command line, so the
+/// helper leaves before reading a frame, saying the agent's own complaint on stderr
+/// and printing nothing on the channel the agent reads.
+#[tokio::test]
+async fn a_chdir_that_cannot_be_done_stops_before_the_first_frame() {
+    let child = Command::new(env!("CARGO_BIN_EXE_ds4-sandbox-helper"))
+        .args(["--chdir", "/definitely/not/here"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start the helper");
+    let output = child.wait_with_output().await.expect("wait");
+    assert_eq!(output.status.code(), Some(1), "{:?}", output.status);
+    assert!(
+        output.stdout.is_empty(),
+        "a refused --chdir printed frames: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let text = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        text.contains("invalid working directory /definitely/not/here"),
+        "{text}"
+    );
+}
+
 #[tokio::test]
 async fn closing_stdin_ends_the_run_cleanly() {
     let mut helper = Helper::start(&[]).await;
