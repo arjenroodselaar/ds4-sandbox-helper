@@ -17,9 +17,55 @@ use std::path::{Path, PathBuf};
 /// mistaken path into an out-of-memory crash.
 pub const MAX_FILE_BYTES: usize = 16 * 1024 * 1024;
 
+/// Everything here that is not a plain read or write goes through
+/// [`tokio::task::spawn_blocking`], for two reasons that are the same reason.
+/// Tokio has no equivalent for the flags these opens need (`O_NOFOLLOW` on the
+/// target, `O_NONBLOCK` so a fifo cannot hang us, an exclusive create for the
+/// temporary), and for the ownership and extended-attribute calls that follow.
+/// And the sequence that replaces a file is a *unit*: checking what is there,
+/// writing a temporary next to it and renaming over the original is only safe if
+/// nothing else interleaves, so it runs as one piece of work on the blocking pool
+/// rather than as a chain of awaits that another request could slip between.
+///
+/// The functions the tools call are therefore `async` wrappers around blocking
+/// bodies, and the byte counts are the same either way: what they protect against
+/// is a tool that never returns, not a tool that takes a worker thread for a while.
+async fn blocking_io<T>(f: impl FnOnce() -> io::Result<T> + Send + 'static) -> io::Result<T>
+where
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .unwrap_or_else(|err| Err(io::Error::other(did_not_finish(&err))))
+}
+
+async fn blocking_text<T>(
+    f: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String>
+where
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .unwrap_or_else(|err| Err(did_not_finish(&err)))
+}
+
+/// The only way a blocking body fails this way is a panic inside it or a runtime
+/// torn down mid-write.  Both are worth reporting as a failed tool rather than
+/// taking the process with them: the frame stream is still usable.
+fn did_not_finish(err: &tokio::task::JoinError) -> String {
+    format!("file operation did not finish: {err}")
+}
+
 /// Opens a path for reading, refusing anything that is not a regular file.  A
 /// device or a fifo would block the read tool forever, and a directory is not text.
-pub fn open_regular(path: &str) -> io::Result<File> {
+pub async fn open_regular(path: &str) -> io::Result<tokio::fs::File> {
+    let path = path.to_string();
+    let file = blocking_io(move || open_regular_blocking(&path)).await?;
+    Ok(tokio::fs::File::from_std(file))
+}
+
+fn open_regular_blocking(path: &str) -> io::Result<File> {
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
@@ -33,8 +79,13 @@ pub fn open_regular(path: &str) -> io::Result<File> {
 
 /// Reads a whole file with the C agent's error wording, which is what the model is
 /// used to seeing for a path it got wrong.
-pub fn read_bytes(path: &str) -> Result<Vec<u8>, String> {
-    let mut file = match open_regular(path) {
+pub async fn read_bytes(path: &str) -> Result<Vec<u8>, String> {
+    let path = path.to_string();
+    blocking_text(move || read_bytes_blocking(&path)).await
+}
+
+fn read_bytes_blocking(path: &str) -> Result<Vec<u8>, String> {
+    let mut file = match open_regular_blocking(path) {
         Ok(file) => file,
         Err(err) => return Err(format!("open {}: {}", path, err_message(&err))),
     };
@@ -85,7 +136,12 @@ fn errno_message(code: i32) -> String {
 /// With `expected`, the current contents must match it exactly: `edit` passes the
 /// bytes it read when it found the `old` selector, so a file that changed between
 /// reading and writing is reported instead of silently overwritten.
-pub fn replace(path: &str, data: &[u8], expected: Option<&[u8]>) -> Result<(), String> {
+pub async fn replace(path: &str, data: Vec<u8>, expected: Option<Vec<u8>>) -> Result<(), String> {
+    let path = path.to_string();
+    blocking_text(move || replace_blocking(&path, &data, expected.as_deref())).await
+}
+
+fn replace_blocking(path: &str, data: &[u8], expected: Option<&[u8]>) -> Result<(), String> {
     let target = Path::new(path);
     let existing = match target.symlink_metadata() {
         Ok(meta) => Some(meta),
@@ -372,8 +428,8 @@ mod tests {
         path
     }
 
-    #[test]
-    fn line_spans_count_an_unterminated_last_line() {
+    #[tokio::test]
+    async fn line_spans_count_an_unterminated_last_line() {
         assert_eq!(line_spans(b"a\nb\nc"), vec![(0, 2), (2, 4), (4, 5)]);
         assert_eq!(line_spans(b"a\r\nb"), vec![(0, 3), (3, 4)]);
         assert_eq!(line_spans(b""), Vec::<(usize, usize)>::new());
@@ -381,11 +437,11 @@ mod tests {
         assert_eq!(line_for_offset(&line_spans(b"a\nb\nc"), 4), 3);
     }
 
-    #[test]
-    fn replacing_a_new_file_leaves_no_temporary_behind() {
+    #[tokio::test]
+    async fn replacing_a_new_file_leaves_no_temporary_behind() {
         let path = temp_path("new");
         let text = path.to_str().unwrap();
-        replace(text, b"hello", None).unwrap();
+        replace(text, b"hello".to_vec(), None).await.unwrap();
         assert_eq!(std::fs::read(text).unwrap(), b"hello");
         let parent = path.parent().unwrap();
         // Only this file's temporaries: other tests are replacing their own files
@@ -404,48 +460,58 @@ mod tests {
         std::fs::remove_file(text).unwrap();
     }
 
-    #[test]
-    fn a_version_guard_rejects_a_file_that_changed() {
+    #[tokio::test]
+    async fn a_version_guard_rejects_a_file_that_changed() {
         let path = temp_path("guard");
         let text = path.to_str().unwrap();
-        replace(text, b"original", None).unwrap();
-        let err = replace(text, b"edited", Some(b"something else")).unwrap_err();
+        replace(text, b"original".to_vec(), None).await.unwrap();
+        let err = replace(text, b"edited".to_vec(), Some(b"something else".to_vec()))
+            .await
+            .unwrap_err();
         assert!(err.contains("changed since it was read"), "{err}");
         assert_eq!(std::fs::read(text).unwrap(), b"original");
-        replace(text, b"edited", Some(b"original")).unwrap();
+        replace(text, b"edited".to_vec(), Some(b"original".to_vec()))
+            .await
+            .unwrap();
         assert_eq!(std::fs::read(text).unwrap(), b"edited");
         std::fs::remove_file(text).unwrap();
     }
 
-    #[test]
-    fn the_file_mode_survives_a_replace() {
+    #[tokio::test]
+    async fn the_file_mode_survives_a_replace() {
         let path = temp_path("mode");
         let text = path.to_str().unwrap();
-        replace(text, b"#!/bin/sh\n", None).unwrap();
+        replace(text, b"#!/bin/sh\n".to_vec(), None).await.unwrap();
         std::fs::set_permissions(text, std::fs::Permissions::from_mode(0o755)).unwrap();
-        replace(text, b"#!/bin/sh\necho hi\n", Some(b"#!/bin/sh\n")).unwrap();
+        replace(
+            text,
+            b"#!/bin/sh\necho hi\n".to_vec(),
+            Some(b"#!/bin/sh\n".to_vec()),
+        )
+        .await
+        .unwrap();
         let mode = std::fs::metadata(text).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o755, "mode {mode:o}");
         std::fs::remove_file(text).unwrap();
     }
 
-    #[test]
-    fn a_hard_linked_file_is_refused() {
+    #[tokio::test]
+    async fn a_hard_linked_file_is_refused() {
         let path = temp_path("hardlink-src");
         let other = temp_path("hardlink-dst");
         let text = path.to_str().unwrap();
         let other_text = other.to_str().unwrap();
-        replace(text, b"data", None).unwrap();
+        replace(text, b"data".to_vec(), None).await.unwrap();
         std::fs::hard_link(text, other_text).unwrap();
-        let err = replace(text, b"new", None).unwrap_err();
+        let err = replace(text, b"new".to_vec(), None).await.unwrap_err();
         assert!(err.contains("hard-linked"), "{err}");
         assert_eq!(std::fs::read(text).unwrap(), b"data");
         std::fs::remove_file(text).unwrap();
         std::fs::remove_file(other_text).unwrap();
     }
 
-    #[test]
-    fn a_symlink_name_writes_the_file_it_resolves_to() {
+    #[tokio::test]
+    async fn a_symlink_name_writes_the_file_it_resolves_to() {
         let dir = std::env::temp_dir();
         let target = temp_path("symlink-target");
         let link = dir.join(format!(
@@ -460,7 +526,9 @@ mod tests {
         // a name that is a symlink reaches its target while a symlink swapped in
         // afterwards is refused.  The name is not a separate file, and replacing it
         // as one would leave the target unreachable.
-        replace(link.to_str().unwrap(), b"replacement", None).unwrap();
+        replace(link.to_str().unwrap(), b"replacement".to_vec(), None)
+            .await
+            .unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"replacement");
         assert!(
             std::fs::symlink_metadata(&link)
@@ -472,14 +540,14 @@ mod tests {
         let _ = std::fs::remove_file(&target);
     }
 
-    #[test]
-    fn opening_a_directory_for_reading_fails() {
-        let err = open_regular("/").unwrap_err();
+    #[tokio::test]
+    async fn opening_a_directory_for_reading_fails() {
+        let err = open_regular("/").await.unwrap_err();
         assert!(matches!(err.raw_os_error(), Some(libc::EINVAL)));
     }
 
-    #[test]
-    fn error_messages_read_like_strerror() {
+    #[tokio::test]
+    async fn error_messages_read_like_strerror() {
         let err = std::fs::File::open("/no/such/file/here").unwrap_err();
         assert_eq!(err_message(&err), errno_message(libc::ENOENT));
     }

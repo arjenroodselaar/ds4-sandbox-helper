@@ -9,6 +9,12 @@
 
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
+use tokio::io::AsyncBufReadExt;
+
+/// A recursive `async fn` cannot return `impl Future` (it would need itself by
+/// value), so the walk hands back a boxed future instead.  The allocation is per
+/// directory, which is nothing next to reading the files inside it.
+type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 
 use regex::{Regex, RegexBuilder};
 
@@ -67,7 +73,7 @@ impl Ctx<'_> {
     }
 }
 
-pub fn search(request: &Request) -> Result<String, String> {
+pub async fn search(request: &Request) -> Result<String, String> {
     let Some(query) = request.arg("query").filter(|q| !q.is_empty()) else {
         return Err("search requires query".into());
     };
@@ -76,8 +82,7 @@ pub fn search(request: &Request) -> Result<String, String> {
     if mode != "literal" && mode != "regex" {
         return Err("search mode must be literal or regex (POSIX extended)".into());
     }
-    let root = Path::new(path);
-    let Ok(meta) = root.metadata() else {
+    let Ok(meta) = tokio::fs::metadata(path).await else {
         return Err(format!(
             "search path is missing, unreadable, or not a regular file/directory: {path}"
         ));
@@ -119,7 +124,7 @@ pub fn search(request: &Request) -> Result<String, String> {
         out: Budget::for_output(),
     };
 
-    walk(&mut ctx, path, 0);
+    walk(&mut ctx, path, 0).await;
 
     let body = ctx.out.text().to_string();
     let mut out = String::new();
@@ -151,66 +156,72 @@ pub fn search(request: &Request) -> Result<String, String> {
 /// Recurses through a file or directory.  The root is followed (`stat`), nested
 /// symlinks are not (`lstat`): a tree that contains a link to `/` should still be one
 /// search, not an exit.
-fn walk(ctx: &mut Ctx, path: &str, depth: usize) {
-    if ctx.full() {
-        return;
-    }
-    if depth > MAX_DEPTH {
-        ctx.stop(path, "directory depth limit reached");
-        return;
-    }
-    let target = Path::new(path);
-    let meta = if depth == 0 {
-        target.metadata()
-    } else {
-        target.symlink_metadata()
-    };
-    let Ok(meta) = meta else {
-        ctx.stop(
-            path,
-            &files::err_message(&std::io::Error::from(std::io::ErrorKind::NotFound)),
-        );
-        return;
-    };
-    if meta.is_file() {
-        search_file(ctx, path);
-        return;
-    }
-    if !meta.is_dir() {
-        ctx.stop(
-            path,
-            "not a regular file or directory (nested symlinks are not followed)",
-        );
-        return;
-    }
-    let entries = match std::fs::read_dir(path) {
-        Ok(entries) => entries,
-        Err(err) => {
-            ctx.stop(path, &files::err_message(&err));
-            return;
-        }
-    };
-    for entry in entries {
+fn walk<'a>(ctx: &'a mut Ctx<'_>, path: &'a str, depth: usize) -> BoxFuture<'a, ()> {
+    Box::pin(async move {
         if ctx.full() {
             return;
         }
-        let Ok(entry) = entry else { continue };
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name == "." || name == ".." {
-            continue;
+        if depth > MAX_DEPTH {
+            ctx.stop(path, "directory depth limit reached");
+            return;
         }
-        // Version control internals are object files and packfiles: searching them
-        // spends the whole result budget on content the model did not write.
-        if name == ".git" {
-            continue;
+        // The root is followed (a link named on the command line is what the model
+        // meant); anything below it is lstat'd, so a link inside the tree is reported
+        // rather than walked.
+        let meta = if depth == 0 {
+            tokio::fs::metadata(path).await
+        } else {
+            tokio::fs::symlink_metadata(path).await
+        };
+        let Ok(meta) = meta else {
+            ctx.stop(
+                path,
+                &files::err_message(&std::io::Error::from(std::io::ErrorKind::NotFound)),
+            );
+            return;
+        };
+        if meta.is_file() {
+            search_file(ctx, path).await;
+            return;
         }
-        let child: PathBuf = entry.path();
-        walk(ctx, &child.to_string_lossy(), depth + 1);
-    }
+        if !meta.is_dir() {
+            ctx.stop(
+                path,
+                "not a regular file or directory (nested symlinks are not followed)",
+            );
+            return;
+        }
+        let mut entries = match tokio::fs::read_dir(path).await {
+            Ok(entries) => entries,
+            Err(err) => {
+                ctx.stop(path, &files::err_message(&err));
+                return;
+            }
+        };
+        loop {
+            if ctx.full() {
+                return;
+            }
+            let Ok(Some(entry)) = entries.next_entry().await else {
+                break;
+            };
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name == "." || name == ".." {
+                continue;
+            }
+            // Version control internals are object files and packfiles: searching them
+            // spends the whole result budget on content the model did not write.
+            if name == ".git" {
+                continue;
+            }
+            let child: PathBuf = entry.path();
+            walk(ctx, &child.to_string_lossy(), depth + 1).await;
+        }
+    })
 }
 
-fn search_file(ctx: &mut Ctx, path: &str) {
+async fn search_file(ctx: &mut Ctx<'_>, path: &str) {
     if ctx.full() {
         return;
     }
@@ -226,14 +237,14 @@ fn search_file(ctx: &mut Ctx, path: &str) {
         }
     }
 
-    let file = match files::open_regular(path) {
+    let file = match files::open_regular(path).await {
         Ok(file) => file,
         Err(err) => {
             ctx.stop(path, &files::err_message(&err));
             return;
         }
     };
-    let mut reader = std::io::BufReader::with_capacity(64 * 1024, file);
+    let mut reader = tokio::io::BufReader::with_capacity(64 * 1024, file);
 
     // Only the current line and the context ring are resident: a file can be a
     // gigabyte and a search over it still has to cost a fixed amount.
@@ -249,7 +260,7 @@ fn search_file(ctx: &mut Ctx, path: &str) {
         if (ctx.results >= ctx.max_results && after == 0) || ctx.out.truncated() {
             break;
         }
-        let text = match read_line(&mut reader) {
+        let text = match read_line(&mut reader).await {
             ReadLine::Line(text) => text,
             ReadLine::Eof => break,
             ReadLine::Binary => {
@@ -307,39 +318,47 @@ enum ReadLine {
     Io(String),
 }
 
-fn read_line<R: std::io::BufRead>(reader: &mut R) -> ReadLine {
+async fn read_line(reader: &mut tokio::io::BufReader<tokio::fs::File>) -> ReadLine {
     let mut bytes: Vec<u8> = Vec::new();
-    let mut one = [0u8; 1];
     loop {
-        match reader.read(&mut one) {
-            Ok(0) => {
-                if bytes.is_empty() {
-                    return ReadLine::Eof;
+        // One byte at a time out of the buffer, not out of the file: the line has to
+        // stop at the first NUL or the 128 KiB mark, and either can fall between two
+        // reads.
+        let byte = match reader.fill_buf().await {
+            Ok(buf) => match buf.first() {
+                Some(byte) => *byte,
+                None => {
+                    return if bytes.is_empty() {
+                        ReadLine::Eof
+                    } else {
+                        ReadLine::Line(String::from_utf8_lossy(&bytes).into_owned())
+                    };
+                }
+            },
+            Err(err) => return ReadLine::Io(files::err_message(&err)),
+        };
+        reader.consume(1);
+        match byte {
+            0 => return ReadLine::Binary,
+            b'\n' => {
+                return ReadLine::Line(String::from_utf8_lossy(&bytes).into_owned());
+            }
+            b'\r' => {
+                // A CRLF is one line break: the newline after a carriage return
+                // belongs to the line just read, not to the next one.
+                if let Ok(buf) = reader.fill_buf().await
+                    && buf.first() == Some(&b'\n')
+                {
+                    reader.consume(1);
                 }
                 return ReadLine::Line(String::from_utf8_lossy(&bytes).into_owned());
             }
-            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(err) => return ReadLine::Io(files::err_message(&err)),
-            Ok(_) => match one[0] {
-                0 => return ReadLine::Binary,
-                b'\n' => return ReadLine::Line(String::from_utf8_lossy(&bytes).into_owned()),
-                b'\r' => {
-                    // A CRLF is one line break: the newline after a carriage return
-                    // belongs to the line just read, not to the next one.
-                    if let Ok(buf) = reader.fill_buf()
-                        && buf.first() == Some(&b'\n')
-                    {
-                        let _ = reader.read(&mut one);
-                    }
-                    return ReadLine::Line(String::from_utf8_lossy(&bytes).into_owned());
+            byte => {
+                if bytes.len() >= MAX_LINE_BYTES {
+                    return ReadLine::Binary;
                 }
-                byte => {
-                    if bytes.len() >= MAX_LINE_BYTES {
-                        return ReadLine::Binary;
-                    }
-                    bytes.push(byte);
-                }
-            },
+                bytes.push(byte);
+            }
         }
     }
 }
@@ -469,13 +488,14 @@ mod tests {
             .unwrap()
     }
 
-    #[test]
-    fn matches_are_grouped_under_their_file_with_a_count_header() {
+    #[tokio::test]
+    async fn matches_are_grouped_under_their_file_with_a_count_header() {
         let root = tree();
         let text = search(&request(&format!(
             r#""query":"needle","path":"{}""#,
             root.display()
         )))
+        .await
         .unwrap();
         assert!(text.starts_with("2 matches shown\n\n"), "{text}");
         let main = root.join("src/main.rs").to_string_lossy().into_owned();
@@ -492,14 +512,15 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    #[test]
-    fn context_lines_come_around_the_match() {
+    #[tokio::test]
+    async fn context_lines_come_around_the_match() {
         let root = tree();
         let main = root.join("src/main.rs");
         let text = search(&request(&format!(
             r#""query":"needle","path":"{}","context":"1""#,
             main.display()
         )))
+        .await
         .unwrap();
         assert!(text.contains("  1 alpha\n"), "{text}");
         assert!(text.contains("  2 needle here\n"), "{text}");
@@ -507,13 +528,14 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    #[test]
-    fn regex_mode_case_insensitivity_and_bad_patterns() {
+    #[tokio::test]
+    async fn regex_mode_case_insensitivity_and_bad_patterns() {
         let root = tree();
         let text = search(&request(&format!(
             r#""query":"N.*e","path":"{}","mode":"regex","case_sensitive":"false","glob":"*.rs""#,
             root.display()
         )))
+        .await
         .unwrap();
         assert!(text.contains("needle here"), "{text}");
         assert!(!text.contains("nothing"), "{text}");
@@ -521,20 +543,24 @@ mod tests {
         let err = search(&request(
             r#""query":"([unclosed","mode":"regex","path":"/tmp""#,
         ))
+        .await
         .unwrap_err();
         assert!(err.starts_with("invalid regex: "), "{err}");
-        let err = search(&request(r#""query":"x","mode":"grep","path":"/tmp""#)).unwrap_err();
+        let err = search(&request(r#""query":"x","mode":"grep","path":"/tmp""#))
+            .await
+            .unwrap_err();
         assert!(err.contains("mode must be literal or regex"), "{err}");
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    #[test]
-    fn the_result_cap_is_reported_as_incomplete_coverage() {
+    #[tokio::test]
+    async fn the_result_cap_is_reported_as_incomplete_coverage() {
         let root = tree();
         let text = search(&request(&format!(
             r#""query":"e","path":"{}","max_results":"1""#,
             root.display()
         )))
+        .await
         .unwrap();
         assert!(text.starts_with("1 match shown\n\n"), "{text}");
         assert!(text.contains("Search incomplete:"), "{text}");
@@ -542,28 +568,31 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    #[test]
-    fn nothing_found_says_so_rather_than_printing_a_header() {
+    #[tokio::test]
+    async fn nothing_found_says_so_rather_than_printing_a_header() {
         let root = tree();
         let text = search(&request(&format!(
             r#""query":"zzzzz","path":"{}""#,
             root.display()
         )))
+        .await
         .unwrap();
         assert_eq!(text, "No matches in searched text\n");
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    #[test]
-    fn a_bad_root_path_is_an_error_not_an_empty_result() {
-        let err = search(&request(r#""query":"x","path":"/no/such/tree""#)).unwrap_err();
+    #[tokio::test]
+    async fn a_bad_root_path_is_an_error_not_an_empty_result() {
+        let err = search(&request(r#""query":"x","path":"/no/such/tree""#))
+            .await
+            .unwrap_err();
         assert!(err.contains("search path is missing"), "{err}");
-        let err = search(&request(r#""path":"/tmp""#)).unwrap_err();
+        let err = search(&request(r#""path":"/tmp""#)).await.unwrap_err();
         assert_eq!(err, "search requires query");
     }
 
-    #[test]
-    fn glob_matching_covers_the_forms_the_tool_documents() {
+    #[tokio::test]
+    async fn glob_matching_covers_the_forms_the_tool_documents() {
         assert!(glob_match("*.c", "main.c"));
         assert!(glob_match("*.c", "src/main.c"), "* crosses /");
         assert!(glob_match("src/*.c", "src/main.c"));
@@ -575,14 +604,15 @@ mod tests {
         assert!(!glob_match("*.c", "main.rs"));
     }
 
-    #[test]
-    fn a_binary_file_is_counted_as_a_skip_not_a_match_source() {
+    #[tokio::test]
+    async fn a_binary_file_is_counted_as_a_skip_not_a_match_source() {
         let root = tree();
         std::fs::write(root.join("src/blob.bin"), b"needle\x00needle").unwrap();
         let text = search(&request(&format!(
             r#""query":"needle","path":"{}""#,
             root.display()
         )))
+        .await
         .unwrap();
         assert!(text.contains("Search incomplete"), "{text}");
         assert!(text.contains("binary data or line exceeds"), "{text}");

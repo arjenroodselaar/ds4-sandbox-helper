@@ -40,13 +40,16 @@ where
     // log next to the helper's stderr.  The alternative, printing to stdout, would be
     // a frame the agent cannot parse.
     let startup = notice(&format!(
-        "ds4-sandbox-helper {} ready: read_lines={}, edit_upto={}",
+        // The read size is named as a default because that is all it is: the agent
+        // sends the real number with each request, and this only matters to a sender
+        // that does not.
+        "ds4-sandbox-helper {} ready: read_lines default {}, edit_upto={}",
         env!("CARGO_PKG_VERSION"),
         config.read_lines,
         config.edit_upto
     ));
     if write(&mut writer, &startup).await.is_err() {
-        session.finish();
+        session.finish().await;
         return Outcome::Finished;
     }
 
@@ -54,11 +57,11 @@ where
         let frame = match wire::read_frame(&mut reader, MAX_REQUEST_BYTES).await {
             Ok(Some(frame)) => frame,
             Ok(None) => {
-                session.finish();
+                session.finish().await;
                 return Outcome::Finished;
             }
             Err(err) => {
-                session.finish();
+                session.finish().await;
                 return Outcome::Fault(err.to_string());
             }
         };
@@ -82,7 +85,7 @@ where
         let request = match protocol::parse_request(&payload) {
             Ok(request) => request,
             Err(err) => {
-                session.finish();
+                session.finish().await;
                 return Outcome::Fault(format!("{err}: {}", truncate_for_log(&payload)));
             }
         };
@@ -107,7 +110,7 @@ where
         };
 
         if let Err(err) = write(&mut writer, &reply).await {
-            session.finish();
+            session.finish().await;
             // The agent exits as soon as the run ends, and a sandbox still writing
             // its last answer at that moment sees EPIPE.  That is a normal ending.
             return if err.kind() == ErrorKind::BrokenPipe {

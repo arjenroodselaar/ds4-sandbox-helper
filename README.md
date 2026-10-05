@@ -29,7 +29,7 @@ through a container's `-e`.
 
 | Option | Env | Default | Why it exists |
 | --- | --- | --- | --- |
-| `--read-lines N` | `DS4_READ_LINES` | `120` | How many lines a bare `read` or `more` returns. The agent picks 120, 240 or 500 from the model's context size; a helper is told nothing about the model, so it is told this. |
+| `--read-lines N` | `DS4_READ_LINES` | `120` | Fallback for how many lines a bare `read` or `more` returns. The agent sends the real number with every request (`limits.read_lines`), because it is the one that knows the model's context size; this is what is used when a request does not say, which in practice means a person at a terminal. |
 | `--edit-upto` | `DS4_EDIT_UPTO` | off | Accepts an `[upto]` marker in `edit`'s `old` text, which selects everything between two anchors. It can delete a great deal at once, so it is opt-in. |
 
 ## Tools
@@ -40,7 +40,20 @@ The answers are the same text the agent produces when it runs these tools itself
 numbers and all: a model should not have to know which side of the pipe it is talking
 to. `bash` keeps jobs running in the background the way the agent does, with the same
 `bash_status` and `bash_stop` follow-ups, and a command that will not stop when told is
-killed along with its process group at the end of its deadline.
+killed along with its process group at the end of its deadline. `refresh_sec` on all
+three is how long the helper is allowed to take, not how long it takes: the answer goes
+out the moment the command finishes, and only a command still running at the deadline
+waits that long. A job finished by a signal reports `exit_status` as 128+signal, so a
+stopped job reads as 143 or 137.
+
+A request carries with it the caps the helper cannot work out for itself, in a
+`limits` object of its own.  The one today is `limits.read_lines`, the size a bare
+`read` or `more` should return: it follows the model's context window, and is capped
+at 500 here whatever the sender asks for.  A limit this version does not know is
+ignored rather than rejected, which is the point of keeping them in an object of
+their own: another cap can be named later without changing the shape of a request.
+`--read-lines` is what a bare read means when the sender says nothing, which in
+practice means a person at a terminal.
 
 There is no path restriction in here. The helper does what it is asked, because it is
 meant to be the thing that runs inside a boundary that is enforced elsewhere. Putting a
@@ -58,6 +71,15 @@ the one thing the design has to avoid.
 | `src/tools/` | One module per tool, plus the dispatch. |
 | `src/server.rs` | The read–dispatch–answer loop. |
 | `tests/e2e.rs` | The real binary over real pipes, real files and real processes. |
+
+## One runtime
+
+Everything is async: the frame loop, the tools, the commands they start. The two
+things that genuinely cannot be async run on the blocking pool instead of the task —
+replacing a file, which is one sequence of open, temporary, copy of ownership and
+rename that has to stay a unit, and the odd open that needs flags Tokio's own options
+do not expose. Nothing blocks the runtime itself, which is what keeps a long `bash`
+job, a slow disk and a big `search` from holding each other up.
 
 ## How much of this is a port
 

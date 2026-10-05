@@ -29,12 +29,12 @@ pub const SANDBOX_TOOLS: [&str; 9] = [
     "bash_stop",
 ];
 
-/// Settings the agent knows and the sandbox cannot work out for itself.
+/// Settings a request does not carry.
 ///
-/// `read_lines` is the one that matters.  The C agent picks its default read size from
-/// the model's context window, which is information the sandbox does not have and
-/// should not guess: a sandbox that read 500 lines because it assumed a big model
-/// would overflow a small one.  It is therefore a startup argument.
+/// `read_lines` is the fallback for the size a bare `read` or `more` returns.  The
+/// agent sends that size in the `limits` object of every request, because it is the
+/// one that knows how big the model's context is, so this only applies to a sender
+/// that says nothing, which in practice means someone driving the helper by hand.
 #[derive(Debug, Clone)]
 pub struct Config {
     pub read_lines: i64,
@@ -59,8 +59,8 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn finish(&mut self) {
-        bash::finish(&mut self.jobs);
+    pub async fn finish(&mut self) {
+        bash::finish(&mut self.jobs).await;
         self.more = None;
     }
 }
@@ -79,7 +79,12 @@ pub async fn run(
             read::read_range(
                 request.arg("path").unwrap_or(""),
                 request.arg_or("start_line", 1, 1, i64::from(i32::MAX)),
-                request.arg_or("max_lines", config.read_lines, 1, i64::from(i32::MAX)),
+                request.arg_or(
+                    "max_lines",
+                    request.read_lines_or(config.read_lines),
+                    1,
+                    i64::from(i32::MAX),
+                ),
                 whole,
                 raw,
                 0,
@@ -87,15 +92,24 @@ pub async fn run(
                 &mut session.more,
                 true,
             )
+            .await
         }
-        "more" => read::more(
-            &mut session.more,
-            request.arg_or("count", config.read_lines, 1, i64::from(i32::MAX)),
-        ),
-        "write" => write::write(request),
-        "edit" => edit::edit(request, config.edit_upto),
-        "list" => list::list(request),
-        "search" => search::search(request),
+        "more" => {
+            read::more(
+                &mut session.more,
+                request.arg_or(
+                    "count",
+                    request.read_lines_or(config.read_lines),
+                    1,
+                    i64::from(i32::MAX),
+                ),
+            )
+            .await
+        }
+        "write" => write::write(request).await,
+        "edit" => edit::edit(request, config.edit_upto).await,
+        "list" => list::list(request).await,
+        "search" => search::search(request).await,
         "bash" => bash::start(request, &mut session.jobs).await,
         "bash_status" => bash::status_tool(request, &mut session.jobs).await,
         "bash_stop" => bash::stop(request, &mut session.jobs).await,

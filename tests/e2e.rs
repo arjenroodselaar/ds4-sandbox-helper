@@ -121,9 +121,19 @@ impl Helper {
     /// Sends a request and returns the reply.  Every argument is a string, which is
     /// what the agent sends: numbers and booleans included.
     async fn call(&mut self, tool: &str, args: serde_json::Value) -> serde_json::Value {
+        self.request(serde_json::json!({ "tool": tool, "args": args }))
+            .await
+    }
+
+    /// Sends a request frame that carries more than a tool and its arguments.  The
+    /// agent puts things the tool cannot work out for itself — how big the model's
+    /// context is, for one — at the top level of the frame, where they sit beside
+    /// `id` rather than inside `args`.
+    async fn request(&mut self, mut frame: serde_json::Value) -> serde_json::Value {
         self.next_id += 1;
         let id = self.next_id;
-        let request = serde_json::json!({ "id": id, "tool": tool, "args": args });
+        frame["id"] = serde_json::json!(id);
+        let request = frame;
         let payload = request.to_string();
         self.stdin
             .write_all(format!("{}\n{payload}", payload.len()).as_bytes())
@@ -404,7 +414,10 @@ async fn a_fast_command_comes_back_with_its_output() {
 async fn a_slow_command_keeps_running_until_it_is_stopped() {
     let mut helper = Helper::start(&[]).await;
 
-    // refresh_sec=0 asks not to wait for it, which is how a long build is started.
+    // A job that will outlast the shortest wait the tool allows: the first
+    // snapshot comes back while it is still running, which is how a long build is
+    // started.  (`refresh_sec` is clamped to at least one second, as it is by the
+    // agent, so this is the shortest possible wait.)
     let started = helper
         .ok(
             "bash",
@@ -438,6 +451,10 @@ async fn a_slow_command_keeps_running_until_it_is_stopped() {
         .ok("bash_stop", serde_json::json!({"job": job.as_str()}))
         .await;
     assert!(stopped.contains("status=done"), "{stopped}");
+    assert!(
+        stopped.contains("exit_status=143") || stopped.contains("exit_status=137"),
+        "{stopped}"
+    );
 
     // The job and its spool file are gone once the model has been shown the end:
     // the sandbox is not a place to accumulate state between runs.
@@ -446,6 +463,46 @@ async fn a_slow_command_keeps_running_until_it_is_stopped() {
         .await;
     assert!(gone.starts_with("bash job not found"), "{gone}");
     assert!(!std::path::Path::new(&spool).exists(), "spool file left");
+
+    helper.finish().await;
+}
+
+/// What `refresh_sec` means on a stop: how long the helper may take, not how long
+/// it takes.  A command that ignores `SIGTERM` is killed by the follow-up signal,
+/// and the answer goes out when it is reaped rather than at the deadline.
+#[tokio::test]
+async fn the_wait_a_stop_asks_for_is_a_ceiling_not_a_delay() {
+    let mut helper = Helper::start(&[]).await;
+    let started = helper
+        .ok(
+            "bash",
+            serde_json::json!({"command": "trap '' TERM; sleep 30", "refresh_sec": "0"}),
+        )
+        .await;
+    assert!(started.contains("status=running"), "{started}");
+    let job = started
+        .split_whitespace()
+        .find_map(|word| word.strip_prefix("job="))
+        .expect("a job handle")
+        .to_string();
+
+    let since = std::time::Instant::now();
+    let stopped = helper
+        .request(serde_json::json!({
+            "tool": "bash_stop", "args": {"job": job.as_str()}, "refresh_sec": "20"
+        }))
+        .await;
+    let took = since.elapsed();
+    let text = stopped["result"].as_str().unwrap_or_default().to_string();
+
+    assert_eq!(stopped["ok"], true, "{stopped}");
+    assert!(text.contains("status=done"), "{text}");
+    // Ignored SIGTERM, so the signal that could not be ignored finished it.
+    assert!(text.contains("exit_status=137"), "{text}");
+    assert!(
+        took < std::time::Duration::from_secs(10),
+        "the stop waited {took:?} for a job that was already dead"
+    );
 
     helper.finish().await;
 }
@@ -460,6 +517,11 @@ async fn a_command_that_ignores_its_deadline_is_killed() {
         )
         .await;
     assert!(text.contains("timed_out=1"), "{text}");
+    // Killed rather than exited, and reported the way a shell reports it.
+    assert!(
+        text.contains("exit_status=143") || text.contains("exit_status=137"),
+        "{text}"
+    );
     helper.finish().await;
 }
 
@@ -577,6 +639,80 @@ async fn a_huge_answer_is_cut_to_the_tool_limit_and_says_so() {
         )
         .await;
     assert!(whole.contains("whole read exceeds"), "{whole}");
+
+    helper.finish().await;
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
+async fn the_read_size_that_comes_with_the_request_wins() {
+    let dir = scratch("readlines");
+    let file = dir.join("numbers.txt");
+    std::fs::write(
+        &file,
+        (1..=1000)
+            .map(|n| format!("line {n}\n"))
+            .collect::<String>(),
+    )
+    .unwrap();
+    let path = file.to_str().unwrap().to_string();
+
+    // Started with a small default, because a helper does not know the model.
+    let mut helper = Helper::start(&["--read-lines", "3"]).await;
+
+    let told = helper
+        .request(serde_json::json!({"tool":"read","limits":{"read_lines":7},"args":{"path":path}}))
+        .await;
+    let text = told["result"].as_str().unwrap_or_default().to_string();
+    assert!(text.contains("lines 1-7 (partial read)"), "{text}");
+
+    // `more` takes its size from the same place, so a resumed read does not
+    // suddenly change width in the middle of a file.  The `max_bytes` beside it is a
+    // cap this helper does not implement, and is ignored rather than fatal.
+    let resumed = helper
+        .request(
+            serde_json::json!({"tool":"more","limits":{"read_lines":2,"max_bytes":100},"args":{}}),
+        )
+        .await;
+    let text = resumed["result"].as_str().unwrap_or_default().to_string();
+    assert!(text.contains("lines 8-9 (partial read)"), "{text}");
+
+    // Without the number, the helper's own setting is what a bare read means.
+    let untold = helper
+        .ok("read", serde_json::json!({"path": path.as_str()}))
+        .await;
+    assert!(untold.contains("lines 1-3 (partial read)"), "{untold}");
+
+    // The size is capped: a frame may ask for a lot, but not for everything.  The
+    // number is written out here because a test of a binary cannot import its
+    // constants, and a ceiling nobody wrote down twice is not checked at all.
+    const CAP: usize = 500;
+    let greedy = helper
+        .request(
+            serde_json::json!({"tool":"read","limits":{"read_lines":50000},"args":{"path":path}}),
+        )
+        .await;
+    let text = greedy["result"].as_str().unwrap_or_default().to_string();
+    assert!(
+        text.contains(&format!("lines 1-{CAP} (partial read)")),
+        "{}",
+        &text[..200.min(text.len())]
+    );
+    assert!(
+        text.contains(&format!("{CAP} line {CAP}\n")),
+        "{}",
+        &text[text.len().saturating_sub(400)..]
+    );
+
+    // A number that is not a number is treated as absent, not as an error: the
+    // model does not write this field, and a broken sender should still get read.
+    let junk = helper
+        .request(
+            serde_json::json!({"tool":"read","limits":{"read_lines":"lots"},"args":{"path":path}}),
+        )
+        .await;
+    let text = junk["result"].as_str().unwrap_or_default().to_string();
+    assert!(text.contains("lines 1-3 (partial read)"), "{text}");
 
     helper.finish().await;
     std::fs::remove_dir_all(dir).ok();

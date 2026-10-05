@@ -12,6 +12,11 @@
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
+/// The most lines a request may ask a bare `read` or `more` to return.  It is the
+/// agent's own largest default, so the cap costs nothing in practice and keeps a
+/// hand-written frame from asking for the file and then some.
+pub const MAX_INJECTED_READ_LINES: i64 = 500;
+
 /// A request from the agent.  Every argument value is a string, numbers and
 /// booleans included, because that is what a parsed tool call holds: there is
 /// nothing to un-quote.  Keeping the type that way also means the sandbox decides
@@ -21,6 +26,35 @@ pub struct Request {
     pub id: i64,
     pub tool: String,
     pub args: BTreeMap<String, String>,
+    /// The caps the sender sent with the request, in its own object.
+    pub limits: Limits,
+}
+
+/// The `limits` object of a request: what the sender is allowed to tell us about
+/// the model on the other side of the pipe, kept apart from `args` because it is
+/// not model input and does not have to be a string.
+///
+/// A member that is absent says nothing, and a member this version does not know is
+/// ignored rather than rejected, so a newer agent can name another cap without
+/// ending the session of an older helper.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Limits {
+    /// How much a `read` or `more` that was not told a size should return, in
+    /// lines.  The agent knows this and we cannot: it follows the size of the model
+    /// context this session is filling, and a helper that guessed would either
+    /// overflow a small model or starve a big one.
+    pub read_lines: Option<i64>,
+}
+
+impl Limits {
+    fn parse(given: Option<&Value>) -> Self {
+        let Some(Value::Object(members)) = given else {
+            return Self::default();
+        };
+        Self {
+            read_lines: members.get("read_lines").and_then(as_whole),
+        }
+    }
 }
 
 impl Request {
@@ -38,6 +72,21 @@ impl Request {
         match self.arg(key).and_then(|v| v.trim().parse::<i64>().ok()) {
             Some(v) => v.clamp(min, max),
             None => default,
+        }
+    }
+
+    /// The size to answer a bare `read` or `more` with.
+    ///
+    /// The number the agent sends wins, because it is the only one of the two that
+    /// knows what the model can hold; `fallback` is the helper's own setting, used
+    /// when the sender says nothing, which in practice means a person driving this
+    /// by hand.  What arrives is capped, because a helper that lets the other end ask
+    /// for ten million lines has handed its output limit to whoever sent it, and
+    /// 500 is the largest size the agent itself will ever ask for.
+    pub fn read_lines_or(&self, fallback: i64) -> i64 {
+        match self.limits.read_lines {
+            Some(lines) => lines.clamp(1, MAX_INJECTED_READ_LINES),
+            None => fallback.max(1),
         }
     }
 
@@ -101,11 +150,24 @@ pub fn parse_request(payload: &[u8]) -> Result<Request, ProtocolError> {
             args.entry(key.clone()).or_insert(text);
         }
     }
+    let limits = Limits::parse(fields.get("limits"));
     Ok(Request {
         id,
         tool: tool.clone(),
         args,
+        limits,
     })
+}
+
+/// A JSON value read as a whole number.  The agent sends limits as numbers, but
+/// every other value on this wire is a string, and a hand-written frame that mixes
+/// the two should still work.
+fn as_whole(value: &Value) -> Option<i64> {
+    match value {
+        Value::Number(n) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)),
+        Value::String(s) => s.trim().parse::<i64>().ok(),
+        _ => None,
+    }
 }
 
 /// A successful answer.  `result` is already formatted for the model: the agent
@@ -234,5 +296,64 @@ mod tests {
         let odd = "quotes \" backslash \\ newline \n tab \t unicode 中 😀 \u{1}";
         let ok: Value = serde_json::from_slice(&response_ok(1, odd)).unwrap();
         assert_eq!(ok["result"].as_str().unwrap(), odd);
+    }
+
+    #[test]
+    fn the_injected_read_size_wins_and_is_capped() {
+        let parse = |frame: &str| parse_request(frame.as_bytes()).unwrap();
+        assert_eq!(
+            parse(r#"{"id":1,"tool":"read","limits":{"read_lines":240},"args":{}}"#)
+                .read_lines_or(120),
+            240
+        );
+        // A sender that says nothing falls back to the helper's own setting.
+        assert_eq!(
+            parse(r#"{"id":1,"tool":"read","args":{}}"#).read_lines_or(120),
+            120
+        );
+        assert_eq!(
+            parse(r#"{"id":1,"tool":"read","limits":{"read_lines":"0"},"args":{}}"#)
+                .read_lines_or(120),
+            1
+        );
+        assert_eq!(
+            parse(r#"{"id":1,"tool":"read","limits":{"read_lines":999999},"args":{}}"#)
+                .read_lines_or(120),
+            crate::protocol::MAX_INJECTED_READ_LINES
+        );
+        // Text is accepted because text is what the rest of the frame is made of,
+        // and nonsense is the same as absent rather than an error the model caused.
+        assert_eq!(
+            parse(r#"{"id":1,"tool":"read","limits":{"read_lines":"many"},"args":{}}"#)
+                .read_lines_or(120),
+            120
+        );
+        assert_eq!(
+            parse(r#"{"id":1,"tool":"read","limits":{"read_lines":"60"},"args":{}}"#)
+                .read_lines_or(120),
+            60
+        );
+        // A cap this version does not know, and a limits object that is not one,
+        // are both ignored: a request is not rejected over a member it cannot read.
+        assert_eq!(
+            parse(r#"{"id":1,"tool":"read","limits":{"max_bytes":10},"args":{}}"#)
+                .read_lines_or(120),
+            120
+        );
+        assert_eq!(
+            parse(r#"{"id":1,"tool":"read","limits":"500","args":{}}"#).read_lines_or(120),
+            120
+        );
+        // A limit is not an argument, and does not arrive in the tool's own view of
+        // the call.
+        assert_eq!(
+            parse(r#"{"id":1,"tool":"read","limits":{"read_lines":240},"args":{}}"#).arg_or(
+                "max_lines",
+                120,
+                1,
+                500
+            ),
+            120
+        );
     }
 }

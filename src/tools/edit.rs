@@ -25,7 +25,7 @@ const EDITED_CONTEXT_TAIL: usize = 18;
 const UPTO_MARKER: &[u8] = b"[upto]";
 
 /// Replaces `old` with `new` in `path`.
-pub fn edit(request: &Request, allow_upto: bool) -> Result<String, String> {
+pub async fn edit(request: &Request, allow_upto: bool) -> Result<String, String> {
     let Some(path) = request.arg("path").filter(|p| !p.is_empty()) else {
         return Err("edit requires path".into());
     };
@@ -41,7 +41,7 @@ pub fn edit(request: &Request, allow_upto: bool) -> Result<String, String> {
         return Err("edit requires new text".into());
     };
 
-    let data = files::read_bytes(path)?;
+    let data = files::read_bytes(path).await?;
     let (offset, removed, anchored) = find_old_span(&data, old.as_bytes(), allow_upto)?;
 
     let mut replacement = Vec::with_capacity(data.len() + new.len());
@@ -49,11 +49,9 @@ pub fn edit(request: &Request, allow_upto: bool) -> Result<String, String> {
     replacement.extend_from_slice(new.as_bytes());
     replacement.extend_from_slice(&data[offset + removed..]);
 
-    // The guard is the bytes the anchor was searched in: if the file moved, the
-    // offset this edit computed points somewhere else, and "somewhere else" is the
-    // part that would corrupt a file.
-    files::replace(path, &replacement, Some(&data))?;
-
+    // The report is assembled before anything is written, because the answer
+    // describes the file as it will be and the new bytes are moved into the write
+    // below.  A failed replace returns an error and this text is dropped with it.
     let old_spans = files::line_spans(&data);
     let new_spans = files::line_spans(&replacement);
     let kind = if anchored {
@@ -96,6 +94,11 @@ pub fn edit(request: &Request, allow_upto: bool) -> Result<String, String> {
             anchor_end as usize,
         );
     }
+
+    // The guard is the bytes the anchor was searched in: if the file moved, the
+    // offset this edit computed points somewhere else, and "somewhere else" is the
+    // part that would corrupt a file.
+    files::replace(path, replacement, Some(data)).await?;
     Ok(out.into_string())
 }
 
@@ -276,8 +279,8 @@ mod tests {
             .replace('\n', "\\n")
     }
 
-    #[test]
-    fn a_unique_edit_reports_the_touched_lines_and_the_context() {
+    #[tokio::test]
+    async fn a_unique_edit_reports_the_touched_lines_and_the_context() {
         let body = (1..=12).map(|n| format!("line {n}\n")).collect::<String>();
         let path = temp("unique", &body);
         let text = edit(
@@ -286,6 +289,7 @@ mod tests {
             )),
             false,
         )
+        .await
         .unwrap();
         assert!(
             text.starts_with(&format!("Edited {path} using old/new replacement\n")),
@@ -303,45 +307,49 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
-    #[test]
-    fn an_ambiguous_selector_is_refused_and_nothing_is_written() {
+    #[tokio::test]
+    async fn an_ambiguous_selector_is_refused_and_nothing_is_written() {
         let path = temp("ambiguous", "aa\nbb\naa\n");
         let err = edit(
             &request(&format!(r#""path":"{path}","old":"aa","new":"cc""#)),
             false,
         )
+        .await
         .unwrap_err();
         assert_eq!(err, "old text anchor is not unique");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "aa\nbb\naa\n");
         std::fs::remove_file(path).unwrap();
     }
 
-    #[test]
-    fn a_missing_anchor_and_a_stale_read_are_both_refused() {
+    #[tokio::test]
+    async fn a_missing_anchor_and_a_stale_read_are_both_refused() {
         let path = temp("missing", "one\n");
         let err = edit(
             &request(&format!(r#""path":"{path}","old":"nope","new":"x""#)),
             false,
         )
+        .await
         .unwrap_err();
         assert_eq!(err, "old text anchor not found");
 
         // Somebody else rewrote the file between the search and the write.
         let stale = {
-            let data = files::read_bytes(&path).unwrap();
+            let data = files::read_bytes(&path).await.unwrap();
             std::fs::write(&path, "someone else\n").unwrap();
             let mut replacement = Vec::new();
             replacement.extend_from_slice(&data[..0]);
             replacement.extend_from_slice(b"mine");
-            files::replace(&path, &replacement, Some(&data)).unwrap_err()
+            files::replace(&path, replacement, Some(data))
+                .await
+                .unwrap_err()
         };
         assert!(stale.contains("changed since it was read"), "{stale}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "someone else\n");
         std::fs::remove_file(path).unwrap();
     }
 
-    #[test]
-    fn adding_lines_reports_the_shift_so_old_numbers_are_not_trusted() {
+    #[tokio::test]
+    async fn adding_lines_reports_the_shift_so_old_numbers_are_not_trusted() {
         // Words rather than bare numbers: "5" also occurs inside "15" and "25",
         // and an anchor that is not unique is refused before anything is written.
         let body = (1..=30).map(|n| format!("row {n}\n")).collect::<String>();
@@ -352,6 +360,7 @@ mod tests {
             )),
             false,
         )
+        .await
         .unwrap();
         assert!(text.contains("Touched old lines 5-5"), "{text}");
         assert!(text.contains("moved by +2"), "{text}");
@@ -359,8 +368,8 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
-    #[test]
-    fn an_upto_span_edits_between_two_anchors_when_enabled() {
+    #[tokio::test]
+    async fn an_upto_span_edits_between_two_anchors_when_enabled() {
         let path = temp("upto", "head\nmiddle junk that is long\ntail\n");
         let old = escape("head\n[upto]\ntail\n");
         let text = edit(
@@ -369,6 +378,7 @@ mod tests {
             )),
             true,
         )
+        .await
         .unwrap();
         assert!(
             text.contains("using anchored old/new replacement"),
@@ -385,19 +395,21 @@ mod tests {
             )),
             false,
         )
+        .await
         .unwrap_err();
         assert_eq!(err, "old text anchor not found");
         std::fs::remove_file(path).unwrap();
     }
 
-    #[test]
-    fn an_upto_marker_needs_a_real_tail_anchor() {
+    #[tokio::test]
+    async fn an_upto_marker_needs_a_real_tail_anchor() {
         let path = temp("upto-tail", "head\nbody\n");
         let old = escape("head\n[upto]\n");
         let err = edit(
             &request(&format!(r#""path":"{path}","old":"{old}","new":"x""#)),
             true,
         )
+        .await
         .unwrap_err();
         assert_eq!(
             err,
@@ -409,13 +421,14 @@ mod tests {
             &request(&format!(r#""path":"{path}","old":"{old}","new":"x""#)),
             true,
         )
+        .await
         .unwrap_err();
         assert_eq!(err, "old text contains more than one [upto] marker");
         std::fs::remove_file(path).unwrap();
     }
 
-    #[test]
-    fn a_long_edited_span_is_summarised_rather_than_dumped() {
+    #[tokio::test]
+    async fn a_long_edited_span_is_summarised_rather_than_dumped() {
         let body = (1..=200).map(|n| format!("{n}\n")).collect::<String>();
         let path = temp("long", &body);
         let text = edit(
@@ -430,39 +443,49 @@ mod tests {
             )),
             false,
         )
+        .await
         .unwrap();
         assert!(text.contains("edited lines omitted"), "{text}");
         assert!(text.len() < 4096, "{} bytes", text.len());
         std::fs::remove_file(path).unwrap();
     }
 
-    #[test]
-    fn argument_errors_come_before_any_disk_access() {
+    #[tokio::test]
+    async fn argument_errors_come_before_any_disk_access() {
         assert_eq!(
-            edit(&request(r#""old":"a","new":"b""#), false).unwrap_err(),
+            edit(&request(r#""old":"a","new":"b""#), false)
+                .await
+                .unwrap_err(),
             "edit requires path"
         );
         assert_eq!(
-            edit(&request(r#""path":"/tmp/x","new":"b""#), false).unwrap_err(),
+            edit(&request(r#""path":"/tmp/x","new":"b""#), false)
+                .await
+                .unwrap_err(),
             "edit requires non-empty old text"
         );
         assert_eq!(
-            edit(&request(r#""path":"/tmp/x","old":"""#), false).unwrap_err(),
+            edit(&request(r#""path":"/tmp/x","old":"""#), false)
+                .await
+                .unwrap_err(),
             "edit requires non-empty old text"
         );
         assert_eq!(
-            edit(&request(r#""path":"/tmp/x","old":"a""#), false).unwrap_err(),
+            edit(&request(r#""path":"/tmp/x","old":"a""#), false)
+                .await
+                .unwrap_err(),
             "edit requires new text"
         );
     }
 
-    #[test]
-    fn an_empty_new_text_deletes_the_span() {
+    #[tokio::test]
+    async fn an_empty_new_text_deletes_the_span() {
         let path = temp("delete", "keep\ndrop\nkeep2\n");
         edit(
             &request(&format!(r#""path":"{path}","old":"drop\n","new":"""#)),
             false,
         )
+        .await
         .unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "keep\nkeep2\n");
         std::fs::remove_file(path).unwrap();

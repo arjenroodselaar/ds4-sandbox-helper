@@ -16,12 +16,12 @@
 
 use std::fmt::Write;
 use std::io::SeekFrom;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use tokio::fs::File;
+use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::process::Command;
 use tokio::sync::watch;
@@ -38,6 +38,9 @@ const DEFAULT_TIMEOUT_SEC: f64 = 3600.0;
 const MAX_TIMEOUT_SEC: f64 = 86_400.0;
 /// How long a stopped job is given to notice the request before it is killed.
 const STOP_GRACE: Duration = Duration::from_secs(1);
+/// How long to wait for the reaper when `bash_stop` was not told how long to wait.
+/// It is a ceiling, not a delay: the answer goes out the moment the job is reaped.
+const STOP_WAIT: Duration = Duration::from_secs(5);
 
 /// What the watcher task knows about a job.  Cloned into every observation, so
 /// reading a snapshot cannot race with the child exiting underneath it.
@@ -108,12 +111,12 @@ impl Jobs {
         })
     }
 
-    fn remove(&mut self, id: i32) {
+    async fn remove(&mut self, id: i32) {
         // A finished job's spool file is deleted with the job: the agent has already
         // been shown the output, and /tmp is not this process's to keep.
         if let Some(index) = self.list.iter().position(|job| job.id == id) {
             let job = self.list.remove(index);
-            let _ = std::fs::remove_file(&job.path);
+            let _ = tokio::fs::remove_file(&job.path).await;
         }
     }
 }
@@ -140,12 +143,13 @@ pub async fn start(request: &Request, jobs: &mut Jobs) -> Result<String, String>
     jobs.next_id += 1;
 
     let path = spool_path();
-    let file = std::fs::OpenOptions::new()
+    let file = OpenOptions::new()
         .create_new(true)
         .write(true)
         .read(true)
         .mode(0o600)
         .open(&path)
+        .await
         .map_err(|err| {
             format!(
                 "bash failed to start: could not create output file: {}",
@@ -154,6 +158,7 @@ pub async fn start(request: &Request, jobs: &mut Jobs) -> Result<String, String>
         })?;
     let stderr_file = file
         .try_clone()
+        .await
         .map_err(|err| format!("bash failed to start: {err}"))?;
 
     let mut child = Command::new("/bin/sh")
@@ -162,8 +167,11 @@ pub async fn start(request: &Request, jobs: &mut Jobs) -> Result<String, String>
         // Never inherit the helper's stdin: it is the request stream, and a command
         // that read from it would eat the agent's next frame.
         .stdin(Stdio::null())
-        .stdout(Stdio::from(file))
-        .stderr(Stdio::from(stderr_file))
+        // The descriptors are handed to the child as plain file descriptors: the
+        // helper never reads these handles again, so there is nothing to keep async
+        // about them.
+        .stdout(Stdio::from(file.into_std().await))
+        .stderr(Stdio::from(stderr_file.into_std().await))
         // A command that forks leaves children behind, and a survivor keeps writing
         // into the spool file after the job was reported stopped.
         .process_group(0)
@@ -179,7 +187,7 @@ pub async fn start(request: &Request, jobs: &mut Jobs) -> Result<String, String>
             match tokio::time::timeout(Duration::from_secs_f64(timeout), child.wait()).await {
                 Ok(Ok(exit)) => Status {
                     running: false,
-                    exit_status: exit.code().unwrap_or(-1),
+                    exit_status: exit_status_of(&exit),
                     timed_out: false,
                     output_error: None,
                     ended_at: Some(Instant::now()),
@@ -197,10 +205,12 @@ pub async fn start(request: &Request, jobs: &mut Jobs) -> Result<String, String>
                     // signal that cannot be caught.
                     tokio::time::sleep(STOP_GRACE).await;
                     kill_group(pid, libc::SIGKILL);
-                    let _ = child.wait().await;
+                    let exit = child.wait().await.ok();
                     Status {
                         running: false,
-                        exit_status: -1,
+                        // Reaping the job we just killed, which is what the C agent
+                        // does here, so the report says which signal finished it.
+                        exit_status: exit.as_ref().map(exit_status_of).unwrap_or(-1),
                         timed_out: true,
                         output_error: None,
                         ended_at: Some(Instant::now()),
@@ -224,7 +234,7 @@ pub async fn start(request: &Request, jobs: &mut Jobs) -> Result<String, String>
     wait_for(&mut jobs.list[index], Duration::from_secs(refresh)).await;
     let text = observation(&mut jobs.list[index]).await;
     if !jobs.list[index].status().running {
-        jobs.remove(id);
+        jobs.remove(id).await;
     }
     Ok(text)
 }
@@ -241,7 +251,7 @@ pub async fn status_tool(request: &Request, jobs: &mut Jobs) -> Result<String, S
     }
     let text = observation(&mut jobs.list[index]).await;
     if !jobs.list[index].status().running {
-        jobs.remove(id);
+        jobs.remove(id).await;
     }
     Ok(text)
 }
@@ -251,6 +261,17 @@ pub async fn stop(request: &Request, jobs: &mut Jobs) -> Result<String, String> 
     let Some(index) = jobs.find_index(id, pid) else {
         return Err(format!("bash job not found: job={id} pid={pid}"));
     };
+    // The caller's patience, as the C agent reads it: a stop with no refresh_sec
+    // still allows a second, and a stop asked to wait for half a minute is allowed
+    // to wait that long for a process that is slow to die.  It is a ceiling, not a
+    // delay; a job that dies at once is reported at once.
+    let refresh = request.arg_or("refresh_sec", 0, 0, 3600);
+    let patience = if refresh > 0 {
+        Duration::from_secs(refresh as u64)
+    } else {
+        STOP_WAIT
+    };
+
     if jobs.list[index].status().running {
         let pid = jobs.list[index].pid;
         kill_group(pid, libc::SIGTERM);
@@ -261,18 +282,18 @@ pub async fn stop(request: &Request, jobs: &mut Jobs) -> Result<String, String> 
     }
     // The reaper still has to notice.  Without this the answer would say "running"
     // for a process that is already a reaped exit status.
-    wait_for(&mut jobs.list[index], Duration::from_secs(5)).await;
+    wait_for(&mut jobs.list[index], patience).await;
     let text = observation(&mut jobs.list[index]).await;
     if !jobs.list[index].status().running {
-        jobs.remove(id);
+        jobs.remove(id).await;
     }
     Ok(text)
 }
 
 /// Forgets every job and removes its spool file, for the session teardown path.
-pub fn finish(jobs: &mut Jobs) {
+pub async fn finish(jobs: &mut Jobs) {
     for job in jobs.list.drain(..) {
-        let _ = std::fs::remove_file(&job.path);
+        let _ = tokio::fs::remove_file(&job.path).await;
     }
 }
 
@@ -281,6 +302,17 @@ fn requested_job(request: &Request) -> (i32, i64) {
         request.arg_or("job", 0, 0, i64::from(i32::MAX)) as i32,
         request.arg_or("pid", 0, 0, i64::from(i32::MAX)),
     )
+}
+
+/// The number the C agent prints as `exit_status`: the exit code, or 128+signal
+/// when a signal finished the process, or -1 when neither is known.  A stopped or
+/// timed-out job therefore reads as 143 or 137, which is the number a shell user
+/// already knows how to read, instead of as a generic failure.
+fn exit_status_of(exit: &std::process::ExitStatus) -> i32 {
+    match exit.code() {
+        Some(code) => code,
+        None => exit.signal().map_or(-1, |sig| 128 + sig),
+    }
 }
 
 /// Waits until the job is no longer running, or until `limit` has passed.
@@ -447,7 +479,10 @@ async fn read_head(path: &Path) -> (String, usize, bool) {
             Err(_) => break,
         }
     }
-    let total = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let total = tokio::fs::metadata(path)
+        .await
+        .map(|m| m.len())
+        .unwrap_or(0);
     let window = &buf[..taken];
     let mut lines = 0;
     let mut cut = window.len();

@@ -13,10 +13,10 @@ use crate::protocol::Request;
 
 const MAX_ENTRIES: usize = 300;
 
-pub fn list(request: &Request) -> Result<String, String> {
+pub async fn list(request: &Request) -> Result<String, String> {
     let path = request.arg("path").filter(|p| !p.is_empty()).unwrap_or(".");
 
-    let entries = match std::fs::read_dir(path) {
+    let mut entries = match tokio::fs::read_dir(path).await {
         Ok(entries) => entries,
         Err(err) => return Err(format!("opendir failed: {}", files::err_message(&err))),
     };
@@ -25,19 +25,21 @@ pub fn list(request: &Request) -> Result<String, String> {
     let _ = writeln!(out, "{path}:");
     let mut shown = 0;
     let mut more = false;
-    for entry in entries {
+    loop {
         if shown >= MAX_ENTRIES {
             // The cap counts entries we printed, so a skipped entry still means
             // there was more to see.
             more = true;
             break;
         }
-        let Ok(entry) = entry else { continue };
+        let Ok(Some(entry)) = entries.next_entry().await else {
+            break;
+        };
         let name = entry.file_name().to_string_lossy().into_owned();
         // lstat, not stat: a symlink is reported as a symlink, which is the only way
         // a model sees that a name in the tree is a pointer somewhere else.
         let full = entry.path();
-        let Ok(meta) = std::fs::symlink_metadata(&full) else {
+        let Ok(meta) = tokio::fs::symlink_metadata(&full).await else {
             continue;
         };
         let file_type = meta.file_type();
@@ -80,8 +82,8 @@ mod tests {
             .unwrap()
     }
 
-    #[test]
-    fn a_directory_shows_kinds_sizes_and_a_trailing_slash() {
+    #[tokio::test]
+    async fn a_directory_shows_kinds_sizes_and_a_trailing_slash() {
         let dir = std::env::temp_dir().join(format!(
             "ds4-helper-list-{}-{}",
             std::process::id(),
@@ -92,7 +94,7 @@ mod tests {
         std::fs::write(dir.join("file.txt"), "12345").unwrap();
         std::os::unix::fs::symlink("file.txt", dir.join("link")).unwrap();
 
-        let text = list(&request(dir.to_str().unwrap())).unwrap();
+        let text = list(&request(dir.to_str().unwrap())).await.unwrap();
         assert!(text.starts_with(&format!("{}:\n", dir.display())), "{text}");
         let sub = text
             .lines()
@@ -114,14 +116,16 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    #[test]
-    fn a_missing_directory_reports_the_errno() {
-        let err = list(&request("/definitely/not/a/directory")).unwrap_err();
+    #[tokio::test]
+    async fn a_missing_directory_reports_the_errno() {
+        let err = list(&request("/definitely/not/a/directory"))
+            .await
+            .unwrap_err();
         assert!(err.starts_with("opendir failed: "), "{err}");
     }
 
-    #[test]
-    fn the_entry_cap_says_so() {
+    #[tokio::test]
+    async fn the_entry_cap_says_so() {
         let dir = std::env::temp_dir().join(format!(
             "ds4-helper-cap-{}-{}",
             std::process::id(),
@@ -132,7 +136,7 @@ mod tests {
         for index in 0..340 {
             std::fs::write(dir.join(format!("f{index}")), b"x").unwrap();
         }
-        let text = list(&request(dir.to_str().unwrap())).unwrap();
+        let text = list(&request(dir.to_str().unwrap())).await.unwrap();
         assert_eq!(
             text.lines().filter(|l| l.starts_with("- ")).count(),
             MAX_ENTRIES
@@ -155,10 +159,10 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn an_absent_path_lists_the_working_directory() {
+    #[tokio::test]
+    async fn an_absent_path_lists_the_working_directory() {
         let request = parse_request(br#"{"id":1,"tool":"list","args":{}}"#).unwrap();
-        let text = list(&request).unwrap();
+        let text = list(&request).await.unwrap();
         assert!(text.starts_with(".:\n"), "{text}");
     }
 }
