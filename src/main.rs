@@ -18,42 +18,89 @@ mod wire;
 
 use std::process::ExitCode;
 
+use clap::{ArgAction, Parser};
 use tools::Config;
 
-const USAGE: &str = "\
-ds4-sandbox-helper — run tools for ds4-agent --sandbox
+// The command line, which is also what --help prints.  The doc comment on the struct
+// would become help text, and these two fields are not the sort of thing to tell a
+// user about, so the words below are chosen for the reader instead.
+#[derive(Debug, Parser)]
+#[command(
+    version,
+    about = "run tools for ds4-agent --sandbox",
+    long_about = "Run tools for a ds4-agent that has no filesystem or shell of its own.\n\
+        \n\
+        Everything the model asks for arrives with the request, as does everything the \
+        agent knows about the model; the options below are what is left, which is what \
+        only whoever started this helper can decide.",
+    after_help = after_help(),
+)]
+struct Args {
+    /// Lines a read returns when max_lines is omitted
+    ///
+    /// The agent works its own number out from the size of the model's context and
+    /// sends it with every request, which is the only way either side can know it,
+    /// so this is the answer for a sender that says nothing: a person at a terminal.
+    #[arg(
+        long,
+        value_name = "N",
+        env = "DS4_READ_LINES",
+        default_value_t = Config::default().read_lines,
+        value_parser = clap::value_parser!(i64).range(1..),
+    )]
+    read_lines: i64,
 
-Usage:
-  ds4-sandbox-helper [options]
+    /// Allow the [upto] anchor in an edit's old text
+    ///
+    /// It matches everything between two anchors, which can delete a great deal at
+    /// once, so it is opt-in.  Matches an agent started with --edit-upto.
+    #[arg(
+        long,
+        env = "DS4_EDIT_UPTO",
+        action = ArgAction::Set,
+        num_args(0..=1),
+        value_name = "BOOL",
+        // Booleans only: the parser also accepts yes/no/on/off/1/0, so listing the
+        // two it prints as "possible values" would understate what it takes.
+        hide_possible_values = true,
+        default_missing_value = "true",
+        default_value_t = false,
+        value_parser = clap::builder::BoolishValueParser::new(),
+    )]
+    edit_upto: bool,
+}
 
-Options:
-  --read-lines N     lines a read returns when max_lines is omitted (default 120;
-                     DS4_READ_LINES does the same job).  The agent picks its own
-                     default from the model's context size and that is not
-                     information a sandbox can see, so it is passed here instead.
-  --edit-upto        allow the [upto] anchor in an edit's old text, matching an
-                     agent started with --edit-upto (DS4_EDIT_UPTO=1 likewise).
-  -h, --help         show this text
-  --version          show the version
+impl Args {
+    fn config(&self) -> Config {
+        Config {
+            read_lines: self.read_lines,
+            edit_upto: self.edit_upto,
+        }
+    }
+}
 
-Arguments are read from stdin as '<byte count>\\n<json>' and answers are written to
-stdout the same way.  Start it as the --sandbox command, for example:
-
-  ds4-agent --sandbox 'ds4-sandbox-helper --read-lines 240' -p 'prompt'
-
-Exit status: 0 when the agent closed the session, 1 when it stopped making sense,
-2 when these arguments could not be read.";
+/// The part of the help text that cannot be written where it is used, because it
+/// names the tools the dispatch actually serves: the help cannot then claim to
+/// serve one that the router does not have.
+fn after_help() -> String {
+    format!(
+        "Arguments are read from stdin as '<byte count>\\n<json>' and answers are\n\
+         written to stdout the same way.  Start it as the agent's --sandbox command:\n\
+         \n\
+         \x20 ds4-agent --sandbox 'ds4-sandbox-helper --read-lines 240' -p 'prompt'\n\
+         \n\
+         Exit status: 0 when the agent closed the session, 1 when it stopped making\n\
+         sense, 2 when these arguments could not be read.\n\
+         \n\
+         Tools served: {}",
+        tools::SANDBOX_TOOLS.join(", ")
+    )
+}
 
 fn main() -> ExitCode {
-    let config = match parse_args(std::env::args().skip(1)) {
-        Ok(Some(config)) => config,
-        Ok(None) => return ExitCode::SUCCESS,
-        Err(reason) => {
-            eprintln!("ds4-sandbox-helper: {reason}");
-            eprintln!("{}", USAGE.trim_end());
-            return ExitCode::from(2);
-        }
-    };
+    // Help and version print and exit successfully; an argument that cannot be read
+    // prints a usage line and exits 2, which is the status the help text promises.
+    let config = Args::parse().config();
 
     // enable_all: the tools wait on pipes, on child processes, and on timers, and a
     // runtime that has not enabled an driver refuses to wait on any of them.
@@ -81,106 +128,144 @@ fn main() -> ExitCode {
     }
 }
 
-/// `Ok(None)` means the process should exit successfully without serving: --help and
-/// --version were asked for, and they are not part of a session.
-fn parse_args<I: Iterator<Item = String>>(args: I) -> Result<Option<Config>, String> {
-    let mut config = Config {
-        read_lines: std::env::var("DS4_READ_LINES")
-            .ok()
-            .and_then(|v| v.trim().parse::<i64>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(120),
-        edit_upto: matches!(
-            std::env::var("DS4_EDIT_UPTO").ok().as_deref(),
-            Some("1") | Some("true") | Some("yes")
-        ),
-    };
-
-    let mut args = args.peekable();
-    // A sandbox command may be started by a shell that appends nothing at all, so an
-    // empty argument list is the normal case rather than a mistake.
-    while let Some(arg) = args.next() {
-        let (name, inline) = match arg.split_once('=') {
-            Some((name, value)) => (name.to_string(), Some(value.to_string())),
-            None => (arg.clone(), None),
-        };
-        match name.as_str() {
-            "-h" | "--help" => {
-                println!("{}", USAGE.trim_end());
-                // Listed here rather than hard-coded in the text above, so the help
-                // cannot claim to serve a tool the dispatch does not have.
-                println!("\nTools served: {}", tools::SANDBOX_TOOLS.join(", "));
-                return Ok(None);
-            }
-            "--version" => {
-                println!("ds4-sandbox-helper {}", env!("CARGO_PKG_VERSION"));
-                return Ok(None);
-            }
-            "--edit-upto" => config.edit_upto = true,
-            "--read-lines" => {
-                let value = match inline.or_else(|| args.next()) {
-                    Some(value) => value,
-                    None => return Err(format!("{name} needs a value")),
-                };
-                config.read_lines = value
-                    .trim()
-                    .parse::<i64>()
-                    .map_err(|_| format!("{name} needs a number of lines, not {value:?}"))?;
-                if config.read_lines <= 0 {
-                    return Err("read-lines must be at least 1".into());
-                }
-            }
-            other => return Err(format!("unknown option {other}")),
-        }
-    }
-    Ok(Some(config))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard};
 
-    fn args(list: &[&str]) -> Result<Config, String> {
-        match parse_args(list.iter().map(|s| s.to_string())) {
-            Ok(Some(config)) => Ok(config),
-            Ok(None) => Err("handled as a one-off request".into()),
-            Err(err) => Err(err),
+    use clap::{CommandFactory, error::ErrorKind};
+
+    /// Parsing looks at the environment as well as the command line, and tests run in
+    /// parallel against one copy of the environment, so every test here takes this
+    /// lock and holds it for as long as it is parsing or changing variables.
+    static ENV: Mutex<()> = Mutex::new(());
+
+    const READ_VAR: &str = "DS4_READ_LINES";
+    const UPTO_VAR: &str = "DS4_EDIT_UPTO";
+
+    /// `list` is the command line after the program name.
+    ///
+    /// The caller holds `ENV`, which is why it is passed in: holding it is the proof
+    /// that nothing else in this process is reading the environment concurrently.
+    fn config_from(list: &[&str], _env: &MutexGuard<'_, ()>) -> Result<Config, clap::Error> {
+        Args::try_parse_from(std::iter::once(env!("CARGO_PKG_NAME")).chain(list.iter().copied()))
+            .map(|args| args.config())
+    }
+
+    /// Runs `body` with neither variable set, and puts back what was there.  What the
+    /// defaults are is only observable when the developer exporting them is not.
+    ///
+    /// # Safety
+    /// Mutating the environment is unsound while another thread reads it, which is
+    /// why the caller must hold `ENV`: every test in this module holds it too.
+    unsafe fn without_env<T>(body: impl FnOnce() -> T) -> T {
+        let saved = [READ_VAR, UPTO_VAR].map(std::env::var_os);
+        for name in [READ_VAR, UPTO_VAR] {
+            unsafe { std::env::remove_var(name) };
         }
+        let out = body();
+        for (name, value) in [READ_VAR, UPTO_VAR].into_iter().zip(saved) {
+            match value {
+                Some(value) => unsafe { std::env::set_var(name, value) },
+                None => unsafe { std::env::remove_var(name) },
+            }
+        }
+        out
     }
 
     #[test]
     fn the_defaults_are_the_conservative_ones() {
-        let config = args(&[]).unwrap();
+        let env = ENV.lock().unwrap();
+        let config = unsafe { without_env(|| config_from(&[], &env)) }.unwrap();
         assert_eq!(config.read_lines, 120);
         assert!(!config.edit_upto);
     }
 
     #[test]
     fn both_spellings_of_an_option_with_a_value_work() {
-        assert_eq!(args(&["--read-lines", "240"]).unwrap().read_lines, 240);
-        assert_eq!(args(&["--read-lines=80"]).unwrap().read_lines, 80);
-        assert!(args(&["--edit-upto"]).unwrap().edit_upto);
+        let env = ENV.lock().unwrap();
+        assert_eq!(
+            config_from(&["--read-lines", "240"], &env)
+                .unwrap()
+                .read_lines,
+            240
+        );
+        assert_eq!(
+            config_from(&["--read-lines=80"], &env).unwrap().read_lines,
+            80
+        );
+        assert!(config_from(&["--edit-upto"], &env).unwrap().edit_upto);
+        // The same switch can be turned back off on the command line, which is how
+        // one turns off what the environment turned on.
+        assert!(!config_from(&["--edit-upto=false"], &env).unwrap().edit_upto);
+    }
+
+    #[test]
+    fn the_environment_sets_the_same_switches() {
+        let env = ENV.lock().unwrap();
+        unsafe {
+            std::env::set_var(READ_VAR, "240");
+            std::env::set_var(UPTO_VAR, "yes");
+        }
+        let config = config_from(&[], &env).unwrap();
+        assert_eq!(config.read_lines, 240);
+        assert!(config.edit_upto);
+        // A command line outranks the environment, which is what makes the variable
+        // a default rather than an override.
+        assert_eq!(
+            config_from(&["--read-lines", "60"], &env)
+                .unwrap()
+                .read_lines,
+            60
+        );
+        unsafe {
+            std::env::remove_var(READ_VAR);
+            std::env::remove_var(UPTO_VAR);
+        }
     }
 
     #[test]
     fn a_bad_value_is_refused_rather_than_ignored() {
-        assert!(args(&["--read-lines", "wide"]).is_err());
-        assert!(args(&["--read-lines", "0"]).is_err());
-        assert!(args(&["--read-lines"]).is_err());
-        assert!(args(&["--nope"]).is_err());
+        let env = ENV.lock().unwrap();
+        for bad in [
+            &["--read-lines", "wide"][..],
+            &["--read-lines", "0"][..],
+            &["--read-lines", "-3"][..],
+            &["--read-lines"][..],
+            &["--edit-upto", "maybe"][..],
+            &["--nope"][..],
+        ] {
+            assert!(config_from(bad, &env).is_err(), "{bad:?} was accepted");
+        }
     }
 
     #[test]
     fn help_and_version_are_not_session_starts() {
-        assert!(
-            parse_args(["--help".to_string()].into_iter())
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            parse_args(["--version".to_string()].into_iter())
-                .unwrap()
-                .is_none()
-        );
+        let _env = ENV.lock().unwrap();
+        // Both are the parse failing with a request to print something, which is how
+        // the binary exits successfully without reading a frame.
+        for (flag, kind) in [
+            ("--help", ErrorKind::DisplayHelp),
+            ("-h", ErrorKind::DisplayHelp),
+            ("--version", ErrorKind::DisplayVersion),
+        ] {
+            let err = Args::try_parse_from([env!("CARGO_PKG_NAME"), flag]).unwrap_err();
+            assert_eq!(err.kind(), kind, "{flag}");
+        }
+    }
+
+    #[test]
+    fn the_help_names_the_options_and_the_served_tools() {
+        let _env = ENV.lock().unwrap();
+        let help = Args::command().render_help().to_string();
+        for expected in ["--read-lines", "--edit-upto", "DS4_EDIT_UPTO"] {
+            assert!(help.contains(expected), "help does not mention {expected}");
+        }
+        // The after-help is where the tool list lives, and it is built from the
+        // router rather than typed twice.
+        let long = Args::command().render_long_help().to_string();
+        for tool in tools::SANDBOX_TOOLS {
+            assert!(long.contains(tool), "help does not list {tool}");
+        }
     }
 }

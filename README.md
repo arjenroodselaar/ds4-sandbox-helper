@@ -25,7 +25,9 @@ ds4-agent --sandbox 'docker run -i --rm -v "$PWD:/w" -w /w helper' …
 ## Options
 
 Both also read the matching environment variable, which is easier than quoting them
-through a container's `-e`.
+through a container's `-e`.  `--help` lists the same two, with their defaults, and a
+value that does not parse — on the command line or in the environment — stops the
+helper with usage on stderr rather than being quietly ignored.
 
 | Option | Env | Default | Why it exists |
 | --- | --- | --- | --- |
