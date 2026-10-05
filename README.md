@@ -83,6 +83,17 @@ rename that has to stay a unit, and the odd open that needs flags Tokio's own op
 do not expose. Nothing blocks the runtime itself, which is what keeps a long `bash`
 job, a slow disk and a big `search` from holding each other up.
 
+## Temporary files
+
+Two files are made on the fly: the one an `edit` or a `write` is replaced through, and
+the one a `bash` command's output is spooled into. Both come from `tempfile`, and both
+keep the names the C agent gives its own — `<name>.ds4-XXXXXX` beside the file being
+replaced, `ds4_agent_output_XXXXXX` in the temp directory — so a leftover from either
+program says the same thing to whoever finds it. `tempfile` also decides what becomes
+of them: a replace temporary that never reached its rename deletes itself, while the
+spool file is handed over to the job, because the model is shown its path and reads it
+back after the command is gone.
+
 ## How much of this is a port
 
 The behaviour is a faithful re-reading of the tool implementations in `ds4_agent.c`,

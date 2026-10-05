@@ -461,15 +461,11 @@ mod tests {
     use super::*;
     use crate::protocol::parse_request;
 
-    fn tree() -> PathBuf {
-        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let nonce = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "ds4-helper-search-{}-{}",
-            std::process::id(),
-            nonce
-        ));
-        let _ = std::fs::remove_dir_all(&root);
+    /// A small source tree, in a directory that deletes itself with the test.  The
+    /// caller keeps the directory by holding the second half of the pair.
+    fn tree() -> (PathBuf, tempfile::TempDir) {
+        let temp = tempfile::TempDir::with_prefix("ds4-helper-search-").unwrap();
+        let root = temp.path().to_path_buf();
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::create_dir_all(root.join(".git")).unwrap();
         std::fs::write(
@@ -480,7 +476,7 @@ mod tests {
         std::fs::write(root.join("src/other.rs"), "needle too\n").unwrap();
         std::fs::write(root.join("notes.txt"), "nothing\n").unwrap();
         std::fs::write(root.join(".git/config"), "needle in git\n").unwrap();
-        root
+        (root, temp)
     }
 
     fn request(args: &str) -> crate::protocol::Request {
@@ -490,7 +486,7 @@ mod tests {
 
     #[tokio::test]
     async fn matches_are_grouped_under_their_file_with_a_count_header() {
-        let root = tree();
+        let (root, _dir) = tree();
         let text = search(&request(&format!(
             r#""query":"needle","path":"{}""#,
             root.display()
@@ -509,12 +505,11 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains(".git"), "{text}");
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
     async fn context_lines_come_around_the_match() {
-        let root = tree();
+        let (root, _dir) = tree();
         let main = root.join("src/main.rs");
         let text = search(&request(&format!(
             r#""query":"needle","path":"{}","context":"1""#,
@@ -525,12 +520,11 @@ mod tests {
         assert!(text.contains("  1 alpha\n"), "{text}");
         assert!(text.contains("  2 needle here\n"), "{text}");
         assert!(text.contains("  3 omega\n"), "{text}");
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
     async fn regex_mode_case_insensitivity_and_bad_patterns() {
-        let root = tree();
+        let (root, _dir) = tree();
         let text = search(&request(&format!(
             r#""query":"N.*e","path":"{}","mode":"regex","case_sensitive":"false","glob":"*.rs""#,
             root.display()
@@ -550,12 +544,11 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("mode must be literal or regex"), "{err}");
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
     async fn the_result_cap_is_reported_as_incomplete_coverage() {
-        let root = tree();
+        let (root, _dir) = tree();
         let text = search(&request(&format!(
             r#""query":"e","path":"{}","max_results":"1""#,
             root.display()
@@ -565,12 +558,11 @@ mod tests {
         assert!(text.starts_with("1 match shown\n\n"), "{text}");
         assert!(text.contains("Search incomplete:"), "{text}");
         assert!(text.contains("match limit reached"), "{text}");
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
     async fn nothing_found_says_so_rather_than_printing_a_header() {
-        let root = tree();
+        let (root, _dir) = tree();
         let text = search(&request(&format!(
             r#""query":"zzzzz","path":"{}""#,
             root.display()
@@ -578,7 +570,6 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(text, "No matches in searched text\n");
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -606,7 +597,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_binary_file_is_counted_as_a_skip_not_a_match_source() {
-        let root = tree();
+        let (root, _dir) = tree();
         std::fs::write(root.join("src/blob.bin"), b"needle\x00needle").unwrap();
         let text = search(&request(&format!(
             r#""query":"needle","path":"{}""#,
@@ -616,6 +607,5 @@ mod tests {
         .unwrap();
         assert!(text.contains("Search incomplete"), "{text}");
         assert!(text.contains("binary data or line exceeds"), "{text}");
-        std::fs::remove_dir_all(root).unwrap();
     }
 }

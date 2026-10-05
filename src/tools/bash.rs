@@ -21,12 +21,14 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use tokio::fs::{File, OpenOptions};
+use tempfile::NamedTempFile;
+use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::process::Command;
 use tokio::sync::watch;
 
 use crate::budget::{Budget, MAX_TOOL_BYTES};
+use crate::files;
 use crate::protocol::Request;
 
 const HEAD_BYTES: u64 = 8 * 1024;
@@ -142,20 +144,9 @@ pub async fn start(request: &Request, jobs: &mut Jobs) -> Result<String, String>
     let id = jobs.next_id;
     jobs.next_id += 1;
 
-    let path = spool_path();
-    let file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .read(true)
-        .mode(0o600)
-        .open(&path)
+    let (file, path) = spool_file()
         .await
-        .map_err(|err| {
-            format!(
-                "bash failed to start: could not create output file: {}",
-                err
-            )
-        })?;
+        .map_err(|err| format!("bash failed to start: could not create output file: {err}"))?;
     let stderr_file = file
         .try_clone()
         .await
@@ -414,17 +405,24 @@ async fn observation(job: &mut Job) -> String {
     out.into_string()
 }
 
-/// `/tmp/ds4_agent_output_XXXXXX`, the name the C agent uses, so a sandbox log and
-/// an agent log say the same thing to whoever is reading them.
-fn spool_path() -> PathBuf {
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0)
-        ^ (std::process::id() << 16);
-    let mut path = std::env::temp_dir();
-    path.push(format!("ds4_agent_output_{nonce:06x}"));
-    path
+/// The file a job's output is spooled into, named `ds4_agent_output_XXXXXX` the way
+/// the C agent names its own, so a sandbox log and an agent log say the same thing to
+/// whoever is reading them.
+///
+/// Two things about it are not the defaults.  It is readable and writable by its
+/// owner only: a command's output can hold anything, including a token, and it is not
+/// cleared on exit because the model reads it back by path long after the command is
+/// gone — which is why the tempfile is handed over with `keep` rather than left to a
+/// destructor.  The name, the exclusive create and the mode all come from `tempfile`.
+async fn spool_file() -> Result<(File, PathBuf), String> {
+    tokio::task::spawn_blocking(|| {
+        let temp = NamedTempFile::with_prefix_in("ds4_agent_output_", std::env::temp_dir())
+            .map_err(|err| files::err_message(&err))?;
+        let (file, path) = temp.keep().map_err(|err| files::err_message(&err.error))?;
+        Ok((File::from(file), path))
+    })
+    .await
+    .map_err(|err| format!("the output file was not created: {err}"))?
 }
 
 fn kill_group(pid: u32, signal: i32) {

@@ -25,22 +25,17 @@ mod tests {
         parse_request(format!(r#"{{"id":1,"tool":"write","args":{{{args}}}}}"#).as_bytes()).unwrap()
     }
 
-    fn temp(tag: &str) -> String {
-        let mut path = std::env::temp_dir();
-        path.push(format!(
-            "ds4-helper-write-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .subsec_nanos()
-        ));
-        path.to_str().unwrap().to_string()
+    /// A file path inside a fresh directory that deletes itself with the test.  The
+    /// caller holds the directory by keeping the second half of the pair, which is
+    /// what the underscore in front of its name means.
+    fn temp(tag: &str) -> (String, tempfile::TempDir) {
+        let dir = tempfile::TempDir::with_prefix(format!("ds4-helper-write-{tag}-")).unwrap();
+        (dir.path().join("file").to_str().unwrap().to_string(), dir)
     }
 
     #[tokio::test]
     async fn a_write_reports_the_byte_count_not_the_character_count() {
-        let path = temp("bytes");
+        let (path, _dir) = temp("bytes");
         let text = write(&request(&format!(
             r#""path":"{path}","content":"héllo 中""#
         )))
@@ -54,7 +49,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_content_truncates_and_absent_content_is_an_error() {
-        let path = temp("truncate");
+        let (path, _dir) = temp("truncate");
         std::fs::write(&path, "previous").unwrap();
         write(&request(&format!(r#""path":"{path}","content":"""#)))
             .await

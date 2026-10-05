@@ -258,19 +258,13 @@ mod tests {
         parse_request(format!(r#"{{"id":1,"tool":"edit","args":{{{args}}}}}"#).as_bytes()).unwrap()
     }
 
-    fn temp(tag: &str, body: &str) -> String {
-        let mut path = std::env::temp_dir();
-        path.push(format!(
-            "ds4-helper-edit-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .subsec_nanos()
-        ));
-        let text = path.to_str().unwrap().to_string();
-        std::fs::write(&text, body).unwrap();
-        text
+    /// A file holding `body`, in a directory that deletes itself with the test.  The
+    /// caller keeps the directory by holding the second half of the pair.
+    fn temp(tag: &str, body: &str) -> (String, tempfile::TempDir) {
+        let dir = tempfile::TempDir::with_prefix(format!("ds4-helper-edit-{tag}-")).unwrap();
+        let path = dir.path().join("file");
+        std::fs::write(&path, body).unwrap();
+        (path.to_str().unwrap().to_string(), dir)
     }
 
     fn escape(text: &str) -> String {
@@ -282,7 +276,7 @@ mod tests {
     #[tokio::test]
     async fn a_unique_edit_reports_the_touched_lines_and_the_context() {
         let body = (1..=12).map(|n| format!("line {n}\n")).collect::<String>();
-        let path = temp("unique", &body);
+        let (path, _dir) = temp("unique", &body);
         let text = edit(
             &request(&format!(
                 r#""path":"{path}","old":"line 5","new":"CHANGED""#
@@ -309,7 +303,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_ambiguous_selector_is_refused_and_nothing_is_written() {
-        let path = temp("ambiguous", "aa\nbb\naa\n");
+        let (path, _dir) = temp("ambiguous", "aa\nbb\naa\n");
         let err = edit(
             &request(&format!(r#""path":"{path}","old":"aa","new":"cc""#)),
             false,
@@ -323,7 +317,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_missing_anchor_and_a_stale_read_are_both_refused() {
-        let path = temp("missing", "one\n");
+        let (path, _dir) = temp("missing", "one\n");
         let err = edit(
             &request(&format!(r#""path":"{path}","old":"nope","new":"x""#)),
             false,
@@ -353,7 +347,7 @@ mod tests {
         // Words rather than bare numbers: "5" also occurs inside "15" and "25",
         // and an anchor that is not unique is refused before anything is written.
         let body = (1..=30).map(|n| format!("row {n}\n")).collect::<String>();
-        let path = temp("shift", &body);
+        let (path, _dir) = temp("shift", &body);
         let text = edit(
             &request(&format!(
                 r#""path":"{path}","old":"row 5","new":"row 5\nrow 5a\nrow 5b""#
@@ -370,7 +364,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_upto_span_edits_between_two_anchors_when_enabled() {
-        let path = temp("upto", "head\nmiddle junk that is long\ntail\n");
+        let (path, _dir) = temp("upto", "head\nmiddle junk that is long\ntail\n");
         let old = escape("head\n[upto]\ntail\n");
         let text = edit(
             &request(&format!(
@@ -388,7 +382,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "replaced\n");
 
         // The same request without the flag treats the marker as literal text.
-        let path = temp("upto-off", "head\nmiddle junk that is long\ntail\n");
+        let (path, _dir) = temp("upto-off", "head\nmiddle junk that is long\ntail\n");
         let err = edit(
             &request(&format!(
                 r#""path":"{path}","old":"{old}","new":"replaced\n""#
@@ -403,7 +397,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_upto_marker_needs_a_real_tail_anchor() {
-        let path = temp("upto-tail", "head\nbody\n");
+        let (path, _dir) = temp("upto-tail", "head\nbody\n");
         let old = escape("head\n[upto]\n");
         let err = edit(
             &request(&format!(r#""path":"{path}","old":"{old}","new":"x""#)),
@@ -430,7 +424,7 @@ mod tests {
     #[tokio::test]
     async fn a_long_edited_span_is_summarised_rather_than_dumped() {
         let body = (1..=200).map(|n| format!("{n}\n")).collect::<String>();
-        let path = temp("long", &body);
+        let (path, _dir) = temp("long", &body);
         let text = edit(
             &request(&format!(
                 r#""path":"{path}","old":"{}","new":"{}""#,
@@ -480,7 +474,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_empty_new_text_deletes_the_span() {
-        let path = temp("delete", "keep\ndrop\nkeep2\n");
+        let (path, _dir) = temp("delete", "keep\ndrop\nkeep2\n");
         edit(
             &request(&format!(r#""path":"{path}","old":"drop\n","new":"""#)),
             false,

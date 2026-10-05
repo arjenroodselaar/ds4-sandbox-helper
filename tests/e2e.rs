@@ -192,23 +192,18 @@ impl Helper {
     }
 }
 
-fn scratch(tag: &str) -> std::path::PathBuf {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    static COUNTER: AtomicUsize = AtomicUsize::new(0);
-    let mut path = std::env::temp_dir();
-    path.push(format!(
-        "ds4-helper-e2e-{tag}-{}-{}",
-        std::process::id(),
-        COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
-    let _ = std::fs::remove_dir_all(&path);
-    std::fs::create_dir_all(&path).expect("scratch directory");
-    path
+/// A directory for one test to make its mess in, deleted when the test ends.  The
+/// caller keeps it by holding the second half of the pair, which is what the
+/// underscore in front of its name means.
+fn scratch(tag: &str) -> (std::path::PathBuf, tempfile::TempDir) {
+    let dir = tempfile::TempDir::with_prefix(format!("ds4-helper-e2e-{tag}-"))
+        .expect("scratch directory");
+    (dir.path().to_path_buf(), dir)
 }
 
 #[tokio::test]
 async fn a_write_and_a_read_round_trip_through_the_wire() {
-    let dir = scratch("write");
+    let (dir, _dir) = scratch("write");
     let file = dir.join("notes.txt");
     let mut helper = Helper::start(&[]).await;
 
@@ -236,12 +231,11 @@ async fn a_write_and_a_read_round_trip_through_the_wire() {
     assert!(missing.starts_with("read failed: "), "{missing}");
 
     helper.finish().await;
-    std::fs::remove_dir_all(dir).ok();
 }
 
 #[tokio::test]
 async fn more_resumes_a_long_file_where_read_stopped() {
-    let dir = scratch("more");
+    let (dir, _dir) = scratch("more");
     let file = dir.join("big.txt");
     std::fs::write(
         &file,
@@ -275,12 +269,11 @@ async fn more_resumes_a_long_file_where_read_stopped() {
     assert_eq!(done, "no previous output to continue");
 
     helper.finish().await;
-    std::fs::remove_dir_all(dir).ok();
 }
 
 #[tokio::test]
 async fn an_edit_reports_the_span_it_touched() {
-    let dir = scratch("edit");
+    let (dir, _dir) = scratch("edit");
     let file = dir.join("main.c");
     std::fs::write(&file, "static int one(void) { return 1; }\n").unwrap();
 
@@ -321,12 +314,11 @@ async fn an_edit_reports_the_span_it_touched() {
     );
 
     helper.finish().await;
-    std::fs::remove_dir_all(dir).ok();
 }
 
 #[tokio::test]
 async fn list_and_search_answer_over_the_same_channel() {
-    let dir = scratch("tree");
+    let (dir, _dir) = scratch("tree");
     std::fs::write(dir.join("a.c"), "int main(void) { return 0; }\n").unwrap();
     std::fs::write(dir.join("b.c"), "int add(int a, int b) { return a + b; }\n").unwrap();
     std::fs::create_dir(dir.join("sub")).unwrap();
@@ -379,7 +371,6 @@ async fn list_and_search_answer_over_the_same_channel() {
     assert_eq!(nothing, "No matches in searched text\n");
 
     helper.finish().await;
-    std::fs::remove_dir_all(dir).ok();
 }
 
 #[tokio::test]
@@ -439,6 +430,16 @@ async fn a_slow_command_keeps_running_until_it_is_stopped() {
         .expect("an output path")
         .to_string();
     assert!(std::path::Path::new(&spool).exists(), "spool file gone");
+    // Named the way the agent names its own command output, so a sandbox log and an
+    // agent log say the same thing to whoever is reading them.
+    assert!(
+        std::path::Path::new(&spool)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("ds4_agent_output_"),
+        "{spool}"
+    );
 
     let later = helper
         .ok("bash_status", serde_json::json!({"job": job.as_str()}))
@@ -614,7 +615,7 @@ async fn closing_stdin_ends_the_run_cleanly() {
 
 #[tokio::test]
 async fn a_huge_answer_is_cut_to_the_tool_limit_and_says_so() {
-    let dir = scratch("limit");
+    let (dir, _dir) = scratch("limit");
     let file = dir.join("long.txt");
     std::fs::write(&file, "x".repeat(2_000_000)).unwrap();
 
@@ -641,12 +642,11 @@ async fn a_huge_answer_is_cut_to_the_tool_limit_and_says_so() {
     assert!(whole.contains("whole read exceeds"), "{whole}");
 
     helper.finish().await;
-    std::fs::remove_dir_all(dir).ok();
 }
 
 #[tokio::test]
 async fn the_read_size_that_comes_with_the_request_wins() {
-    let dir = scratch("readlines");
+    let (dir, _dir) = scratch("readlines");
     let file = dir.join("numbers.txt");
     std::fs::write(
         &file,
@@ -715,5 +715,4 @@ async fn the_read_size_that_comes_with_the_request_wins() {
     assert!(text.contains("lines 1-3 (partial read)"), "{text}");
 
     helper.finish().await;
-    std::fs::remove_dir_all(dir).ok();
 }

@@ -69,14 +69,6 @@ mod tests {
     use super::*;
     use crate::protocol::parse_request;
 
-    /// Cargo runs the tests in one process in parallel, so a name built from the
-    /// process id alone would be shared by two tests at the same moment.
-    fn unique() -> usize {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static N: AtomicUsize = AtomicUsize::new(0);
-        N.fetch_add(1, Ordering::Relaxed)
-    }
-
     fn request(path: &str) -> crate::protocol::Request {
         parse_request(format!(r#"{{"id":1,"tool":"list","args":{{"path":"{path}"}}}}"#).as_bytes())
             .unwrap()
@@ -84,12 +76,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_directory_shows_kinds_sizes_and_a_trailing_slash() {
-        let dir = std::env::temp_dir().join(format!(
-            "ds4-helper-list-{}-{}",
-            std::process::id(),
-            unique()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         std::fs::write(dir.join("file.txt"), "12345").unwrap();
         std::os::unix::fs::symlink("file.txt", dir.join("link")).unwrap();
@@ -113,7 +101,6 @@ mod tests {
             .find(|l| l.ends_with("link"))
             .unwrap_or_default();
         assert!(link.starts_with('l'), "{link}");
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]
@@ -126,13 +113,8 @@ mod tests {
 
     #[tokio::test]
     async fn the_entry_cap_says_so() {
-        let dir = std::env::temp_dir().join(format!(
-            "ds4-helper-cap-{}-{}",
-            std::process::id(),
-            unique()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
         for index in 0..340 {
             std::fs::write(dir.join(format!("f{index}")), b"x").unwrap();
         }
@@ -146,7 +128,6 @@ mod tests {
             "tail: {}",
             tail(&text)
         );
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     fn tail(text: &str) -> String {

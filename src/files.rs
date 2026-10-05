@@ -9,8 +9,10 @@
 use std::fs::{File, Metadata, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-use std::path::{Path, PathBuf};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::Path;
+
+use tempfile::NamedTempFile;
 
 /// Largest file a tool will hold in memory.  `edit` needs the whole file to prove
 /// that its `old` selector is unique, and an unbounded read here would turn a
@@ -20,8 +22,8 @@ pub const MAX_FILE_BYTES: usize = 16 * 1024 * 1024;
 /// Everything here that is not a plain read or write goes through
 /// [`tokio::task::spawn_blocking`], for two reasons that are the same reason.
 /// Tokio has no equivalent for the flags these opens need (`O_NOFOLLOW` on the
-/// target, `O_NONBLOCK` so a fifo cannot hang us, an exclusive create for the
-/// temporary), and for the ownership and extended-attribute calls that follow.
+/// target, `O_NONBLOCK` so a fifo cannot hang us), nor for the exclusive create of
+/// the temporary or the ownership and extended-attribute calls that follow.
 /// And the sequence that replaces a file is a *unit*: checking what is there,
 /// writing a temporary next to it and renaming over the original is only safe if
 /// nothing else interleaves, so it runs as one piece of work on the blocking pool
@@ -149,14 +151,10 @@ fn replace_blocking(path: &str, data: &[u8], expected: Option<&[u8]>) -> Result<
         Err(err) => return Err(err_message(&err)),
     };
 
-    let mut temp_path: Option<PathBuf> = None;
-    let result = replace_inner(target, existing.as_ref(), data, expected, &mut temp_path);
-    if result.is_err()
-        && let Some(temp) = &temp_path
-    {
-        let _ = std::fs::remove_file(temp);
-    }
-    result
+    // Nothing to clean up here: the temporary a replacement is written into deletes
+    // itself when it is dropped, which is every path that did not get as far as the
+    // rename.
+    replace_inner(target, existing.as_ref(), data, expected)
 }
 
 fn replace_inner(
@@ -164,7 +162,6 @@ fn replace_inner(
     existing: Option<&Metadata>,
     data: &[u8],
     expected: Option<&[u8]>,
-    temp_path: &mut Option<PathBuf>,
 ) -> Result<(), String> {
     if existing.is_some() {
         // Resolve the name so the temporary lands next to the file, then refuse
@@ -192,12 +189,12 @@ fn replace_inner(
                 target.display()
             ));
         }
-        copy_metadata(&source, data, target, mode, temp_path)?;
+        let temp = copy_metadata(&source, data, &resolved, mode)?;
         // Renamed onto the resolved name rather than the one we were given: the
         // target file is replaced in place and a symlink pointing at it goes on
         // pointing at it, where renaming over the name would turn the link into a
         // ordinary file and orphan whatever it referred to.
-        return rename(temp_path, &resolved);
+        return rename(temp, &resolved);
     }
 
     if expected.is_some() {
@@ -208,8 +205,7 @@ fn replace_inner(
             target.display()
         ));
     }
-    create_new(target, data, temp_path)?;
-    rename(temp_path, target)
+    rename(create_new(target, data)?, target)
 }
 
 /// True when the file still holds exactly `wanted`.  Compared in chunks and short-
@@ -242,56 +238,43 @@ fn same_contents(file: &File, wanted: &[u8]) -> bool {
     }
 }
 
-/// Writes the new bytes into a temporary next to the target.  The temporary is
-/// created exclusively with a random suffix, so two agents editing the same file
-/// cannot write through each other's temporary.
-fn temp_for(target: &Path) -> PathBuf {
+/// The temporary a replacement is written into, next to the target and named the way
+/// the C agent names its own — `<name>.ds4-XXXXXX` — so that a leftover from either
+/// program reads the same to whoever finds it.  `tempfile` supplies the random tail,
+/// creates the file exclusively, and deletes it if it is dropped before the rename;
+/// the mode goes to `open`, so a brand new file still has the umask applied to it
+/// while a replaced one is born with the target's own bits.
+///
+/// The builder is what makes that mode part of the create; the shorter
+/// `NamedTempFile::with_prefix_in` cannot say it, and setting the permissions
+/// afterwards would go through `chmod`, which ignores the umask and would leave a
+/// brand new file world-writable.
+fn temp_for(target: &Path, mode: u32) -> Result<NamedTempFile, String> {
+    let dir = match target.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
     let name = target
         .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
+        .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "file".to_string());
-    let mut random = [0u8; 4];
-    // Not for secrets: it only has to be unpredictable to another process racing
-    // for the same name.
-    let seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0)
-        ^ (std::process::id() << 16);
-    let mut state = seed | 1;
-    for byte in random.iter_mut() {
-        state ^= state << 13;
-        state ^= state >> 17;
-        state ^= state << 5;
-        *byte = (state & 0xff) as u8;
-    }
-    let suffix = random.iter().fold(String::new(), |mut acc, b| {
-        acc.push_str(&format!("{b:02x}"));
-        acc
-    });
-    target.with_file_name(format!("{name}.ds4-{suffix}"))
+    tempfile::Builder::new()
+        .prefix(&format!("{name}.ds4-"))
+        .permissions(std::fs::Permissions::from_mode(mode))
+        .tempfile_in(dir)
+        .map_err(|err| err_message(&err))
 }
 
-fn write_temp(temp: &Path, data: &[u8], mode: u32) -> Result<(), String> {
-    // The temporary is always created exclusively: a name that already exists
-    // means something else is writing there, and that is not ours to clobber.
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(mode)
-        .custom_flags(libc::O_CLOEXEC)
-        .open(temp)
-        .map_err(|err| err_message(&err))?;
-    file.write_all(data).map_err(|err| err_message(&err))?;
-    file.flush().map_err(|err| err_message(&err))?;
-    Ok(())
+/// A temporary holding the new bytes, with the mode the finished file should have.
+fn write_temp(target: &Path, data: &[u8], mode: u32) -> Result<NamedTempFile, String> {
+    let mut temp = temp_for(target, mode)?;
+    temp.write_all(data).map_err(|err| err_message(&err))?;
+    Ok(temp)
 }
 
-fn create_new(target: &Path, data: &[u8], temp_path: &mut Option<PathBuf>) -> Result<(), String> {
-    let temp = temp_for(target);
-    *temp_path = Some(temp.clone());
+fn create_new(target: &Path, data: &[u8]) -> Result<NamedTempFile, String> {
     // 0o666 and let open() apply the umask, which is what a brand new file wants.
-    write_temp(&temp, data, 0o666)
+    write_temp(target, data, 0o666)
 }
 
 /// Replaces an existing file, keeping its owner and permissions.  The temporary is
@@ -302,59 +285,40 @@ fn copy_metadata(
     data: &[u8],
     target: &Path,
     mode: u32,
-    temp_path: &mut Option<PathBuf>,
-) -> Result<(), String> {
-    let temp = temp_for(target);
-    *temp_path = Some(temp.clone());
-    write_temp(&temp, data, mode & 0o7777)?;
+) -> Result<NamedTempFile, String> {
+    let temp = write_temp(target, data, mode & 0o7777)?;
 
-    let uid = source.metadata().map(|m| m.uid()).unwrap_or(u32::MAX);
-    let gid = source.metadata().map(|m| m.gid()).unwrap_or(u32::MAX);
-    let file = File::open(&temp).map_err(|err| err_message(&err))?;
+    let owner = source.metadata().ok();
+    let uid = owner.as_ref().map(MetadataExt::uid).unwrap_or(u32::MAX);
+    let gid = owner.as_ref().map(MetadataExt::gid).unwrap_or(u32::MAX);
     // Ownership can only be given away by root; failing that is not a reason to
     // lose the edit, since the file is still the right bytes and mode.
-    unsafe {
-        libc::fchown(
-            file.as_raw_fd() as libc::c_int,
-            uid as libc::uid_t,
-            gid as libc::gid_t,
-        )
-    };
+    unsafe { libc::fchown(temp.as_raw_fd(), uid as libc::uid_t, gid as libc::gid_t) };
 
     #[cfg(target_os = "macos")]
     {
         // Carry the ACL and extended attributes the same way the C agent does.
         // Unlike the C version this is best effort: losing an xattr is worth
-        // reporting, not worth losing the edit over.
-        let src = File::open(target).map(|f| f.as_raw_fd()).unwrap_or(-1);
-        let dst = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&temp)
-            .map(|f| f.as_raw_fd())
-            .unwrap_or(-1);
-        if src >= 0 && dst >= 0 {
-            unsafe {
-                libc::fcopyfile(
-                    src as libc::c_int,
-                    dst as libc::c_int,
-                    std::ptr::null_mut(),
-                    libc::COPYFILE_ACL | libc::COPYFILE_XATTR,
-                )
-            };
-        }
+        // reporting, not worth losing the edit over.  Both descriptors are already
+        // open in the direction this needs: the target for reading, the temporary
+        // for writing.
+        unsafe {
+            libc::fcopyfile(
+                source.as_raw_fd(),
+                temp.as_raw_fd(),
+                std::ptr::null_mut(),
+                libc::COPYFILE_ACL | libc::COPYFILE_XATTR,
+            )
+        };
     }
-    Ok(())
+    Ok(temp)
 }
 
-fn rename(temp_path: &mut Option<PathBuf>, target: &Path) -> Result<(), String> {
-    let temp = temp_path
-        .as_ref()
-        .ok_or_else(|| "no temporary file was created".to_string())?;
-    std::fs::rename(temp, target).map_err(|err| {
-        let message = err_message(&err);
-        format!("rename {}: {}", target.display(), message)
-    })?;
-    *temp_path = None;
+/// Moves the temporary onto the target, which is what makes the replacement atomic,
+/// and takes it out of the destructor's reach on the way.
+fn rename(temp: NamedTempFile, target: &Path) -> Result<(), String> {
+    temp.persist(target)
+        .map_err(|err| format!("rename {}: {}", target.display(), err_message(&err.error)))?;
     Ok(())
 }
 
@@ -405,27 +369,14 @@ pub fn line_for_offset(spans: &[(usize, usize)], offset: usize) -> usize {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
 
-    /// Cargo runs the tests in one process in parallel, so a name built from the
-    /// process id alone would be shared by two tests at the same moment.
-    fn unique() -> usize {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static N: AtomicUsize = AtomicUsize::new(0);
-        N.fetch_add(1, Ordering::Relaxed)
-    }
-
-    fn temp_path(tag: &str) -> PathBuf {
-        let mut path = std::env::temp_dir();
-        path.push(format!(
-            "ds4-helper-{}-{}-{}",
-            tag,
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .subsec_nanos()
-        ));
-        path
+    /// A file path inside a fresh directory that deletes itself with the test.  The
+    /// caller keeps the directory by holding the second half of the pair, which is
+    /// what the underscore in front of its name means.
+    fn temp_path(tag: &str) -> (PathBuf, tempfile::TempDir) {
+        let dir = tempfile::TempDir::with_prefix(format!("ds4-helper-{tag}-")).unwrap();
+        (dir.path().join("file"), dir)
     }
 
     #[tokio::test]
@@ -437,9 +388,36 @@ mod tests {
         assert_eq!(line_for_offset(&line_spans(b"a\nb\nc"), 4), 3);
     }
 
+    #[test]
+    fn the_temporary_bears_the_targets_name_and_the_agents_suffix() {
+        let (path, _dir) = temp_path("tempfor");
+        let temp = temp_for(&path, 0o600).unwrap();
+        let name = temp
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        // `file.ds4-XXXXXX`, in the target's own directory: the shape the C agent's
+        // mkstemp leaves behind, and the reason the last step is a rename rather
+        // than a copy that could cross onto another filesystem.
+        let tail = name.strip_prefix("file.ds4-").unwrap_or_default();
+        assert_eq!(tail.len(), 6, "temporary named {name}");
+        assert_eq!(temp.path().parent().unwrap(), path.parent().unwrap());
+        assert_eq!(
+            temp.as_file().metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        // And it is the handle that owns it: nothing is left to rot next to a file
+        // whose replacement failed halfway.
+        let left = temp.path().to_path_buf();
+        drop(temp);
+        assert!(!left.exists(), "the temporary outlived its handle");
+    }
+
     #[tokio::test]
     async fn replacing_a_new_file_leaves_no_temporary_behind() {
-        let path = temp_path("new");
+        let (path, _dir) = temp_path("new");
         let text = path.to_str().unwrap();
         replace(text, b"hello".to_vec(), None).await.unwrap();
         assert_eq!(std::fs::read(text).unwrap(), b"hello");
@@ -462,7 +440,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_version_guard_rejects_a_file_that_changed() {
-        let path = temp_path("guard");
+        let (path, _dir) = temp_path("guard");
         let text = path.to_str().unwrap();
         replace(text, b"original".to_vec(), None).await.unwrap();
         let err = replace(text, b"edited".to_vec(), Some(b"something else".to_vec()))
@@ -479,7 +457,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_file_mode_survives_a_replace() {
-        let path = temp_path("mode");
+        let (path, _dir) = temp_path("mode");
         let text = path.to_str().unwrap();
         replace(text, b"#!/bin/sh\n".to_vec(), None).await.unwrap();
         std::fs::set_permissions(text, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -497,8 +475,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_hard_linked_file_is_refused() {
-        let path = temp_path("hardlink-src");
-        let other = temp_path("hardlink-dst");
+        let (path, _dir) = temp_path("hardlink-src");
+        let (other, _other) = temp_path("hardlink-dst");
         let text = path.to_str().unwrap();
         let other_text = other.to_str().unwrap();
         replace(text, b"data".to_vec(), None).await.unwrap();
@@ -512,14 +490,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_symlink_name_writes_the_file_it_resolves_to() {
-        let dir = std::env::temp_dir();
-        let target = temp_path("symlink-target");
-        let link = dir.join(format!(
-            "ds4-helper-symlink-{}-{}",
-            std::process::id(),
-            unique()
-        ));
-        let _ = std::fs::remove_file(&link);
+        let dir = tempfile::tempdir().unwrap();
+        let (target, _target_dir) = temp_path("symlink-target");
+        let link = dir.path().join("link");
         std::fs::write(&target, b"victim").unwrap();
         std::os::unix::fs::symlink(&target, &link).unwrap();
         // The agent resolves the path first and then opens it without following, so

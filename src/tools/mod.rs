@@ -154,16 +154,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_round_trip_through_the_dispatch_works() {
-        let path = std::env::temp_dir().join(format!(
-            "ds4-helper-mod-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .subsec_nanos()
-        ));
-        let text = path.to_str().unwrap().to_string();
-        let _ = std::fs::remove_file(&path);
+        let dir = tempfile::tempdir().unwrap();
+        let text = dir.path().join("file").to_str().unwrap().to_string();
         call(
             "write",
             &format!(r#""path":"{text}","content":"one\ntwo\n""#),
@@ -173,6 +165,5 @@ mod tests {
         let read = call("read", &format!(r#""path":"{text}""#)).await.unwrap();
         assert!(read.contains("1 one\n"), "{read}");
         call("bash", r#""command":"true""#).await.unwrap();
-        std::fs::remove_file(&path).unwrap();
     }
 }

@@ -285,23 +285,13 @@ fn io_failure(err: std::io::Error) -> String {
 mod tests {
     use super::*;
 
-    fn temp_path(tag: &str) -> std::path::PathBuf {
-        let mut path = std::env::temp_dir();
-        path.push(format!(
-            "ds4-helper-read-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .subsec_nanos()
-        ));
-        path
-    }
-
-    fn write_file(tag: &str, bytes: &[u8]) -> std::path::PathBuf {
-        let path = temp_path(tag);
+    /// A file holding `bytes`, in a directory that deletes itself with the test.  The
+    /// caller keeps the directory by holding the second half of the pair.
+    fn write_file(tag: &str, bytes: &[u8]) -> (std::path::PathBuf, tempfile::TempDir) {
+        let dir = tempfile::TempDir::with_prefix(format!("ds4-helper-read-{tag}-")).unwrap();
+        let path = dir.path().join("file");
         std::fs::write(&path, bytes).unwrap();
-        path
+        (path, dir)
     }
 
     #[allow(clippy::type_complexity)]
@@ -322,7 +312,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_short_file_reads_whole_with_a_header() {
-        let path = write_file("short", b"alpha\nbravo\ncharlie\n");
+        let (path, _dir) = write_file("short", b"alpha\nbravo\ncharlie\n");
         let text = read(&path, 1, 500).await.unwrap();
         assert!(
             text.starts_with(&format!("{}: lines 1-3 (end of file)\n", path.display())),
@@ -336,7 +326,7 @@ mod tests {
     #[tokio::test]
     async fn a_partial_read_names_where_to_resume_and_remembers_it() {
         let body = (1..=50).map(|n| format!("line {n}\n")).collect::<String>();
-        let path = write_file("partial", body.as_bytes());
+        let (path, _dir) = write_file("partial", body.as_bytes());
         let mut state = None;
         let text = read_range(
             path.to_str().unwrap(),
@@ -369,7 +359,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_resume_inside_a_line_says_continued() {
-        let path = write_file("midline", b"first\n0123456789abcdefghijklmnop\nlast\n");
+        let (path, _dir) = write_file("midline", b"first\n0123456789abcdefghijklmnop\nlast\n");
         let mut state = Some(MoreState {
             path: path.to_str().unwrap().to_string(),
             next_line: 2,
@@ -385,7 +375,7 @@ mod tests {
 
     #[tokio::test]
     async fn carriage_returns_become_line_ends_unless_the_read_is_bare() {
-        let path = write_file("crlf", b"one\r\ntwo\rthree\n");
+        let (path, _dir) = write_file("crlf", b"one\r\ntwo\rthree\n");
         let text = read(&path, 1, 10).await.unwrap();
         assert!(text.contains("lines 1-3 (end of file)"), "{text}");
         assert!(!text.contains('\r'), "{text:?}");
@@ -411,7 +401,7 @@ mod tests {
 
     #[tokio::test]
     async fn binary_content_is_refused() {
-        let path = write_file("binary", b"text\x00more");
+        let (path, _dir) = write_file("binary", b"text\x00more");
         assert_eq!(
             read(&path, 1, 10).await.unwrap_err(),
             "read encountered binary data"
@@ -422,7 +412,7 @@ mod tests {
     #[tokio::test]
     async fn whole_is_an_error_rather_than_a_silent_cut() {
         let body = "x\n".repeat(600 * 1024);
-        let path = write_file("whole", body.as_bytes());
+        let (path, _dir) = write_file("whole", body.as_bytes());
         let err = read_range(
             path.to_str().unwrap(),
             1,
@@ -443,7 +433,7 @@ mod tests {
     #[tokio::test]
     async fn a_read_stops_at_the_limit_without_splitting_a_character() {
         let body = "中文".repeat(80 * 1024);
-        let path = write_file("wide", body.as_bytes());
+        let (path, _dir) = write_file("wide", body.as_bytes());
         let mut state = None;
         let text = read_range(
             path.to_str().unwrap(),
@@ -495,7 +485,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_read_clears_the_resume_state() {
-        let path = write_file("clears", &"line\n".repeat(200).into_bytes());
+        let (path, _dir) = write_file("clears", &"line\n".repeat(200).into_bytes());
         let mut state = None;
         read_range(
             path.to_str().unwrap(),
@@ -521,7 +511,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_line_range_past_the_end_reads_nothing() {
-        let path = write_file("past", b"one\ntwo\n");
+        let (path, _dir) = write_file("past", b"one\ntwo\n");
         let text = read(&path, 99, 10).await.unwrap();
         assert!(text.contains("lines 0-0 (end of file)"), "{text}");
         std::fs::remove_file(path).unwrap();
