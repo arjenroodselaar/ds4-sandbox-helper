@@ -192,12 +192,18 @@ fn replace_inner(
         if let Some(wanted) = expected
             && !same_contents(&source, wanted)
         {
-            return Err(format!(
-                "file changed since it was read: {}",
-                target.display()
-            ));
+            return Err(changed(target));
         }
         let temp = copy_metadata(&source, data, &resolved, mode)?;
+        // The last look before committing, taken exactly where the C agent takes it.
+        // Everything between reading the file and this moment is the window a
+        // concurrent writer can slip into, and matching bytes are not enough to shut
+        // it: a writer that replaced the file with identical content moved a
+        // different inode into the name, and the edit would then have replaced a
+        // file that nobody had read.
+        if !still_the_same(target, &resolved, &source_meta) {
+            return Err(changed(target));
+        }
         // Renamed onto the resolved name rather than the one we were given: the
         // target file is replaced in place and a symlink pointing at it goes on
         // pointing at it, where renaming over the name would turn the link into a
@@ -208,12 +214,24 @@ fn replace_inner(
     if expected.is_some() {
         // The edit read a file that is no longer there; that is the same race as a
         // changed file and gets the same answer.
-        return Err(format!(
-            "file changed since it was read: {}",
-            target.display()
-        ));
+        return Err(changed(target));
     }
-    rename(create_new(target, data)?, target)
+    link_new(create_new(target, data)?, target)
+}
+
+/// What the agent says when the file is not the one the edit was worked out against.
+/// The wording is the agent's own, because it is what models have been tuned against,
+/// and it tells the model the one useful next step: read again.
+fn changed(target: &Path) -> String {
+    format!(
+        "file changed while editing; read it again: {}",
+        target.display()
+    )
+}
+
+/// The agent's wording for a replacement the filesystem itself refused.
+fn failed(target: &Path, err: &io::Error) -> String {
+    format!("replace {}: {}", target.display(), err_message(err))
 }
 
 /// True when the file still holds exactly `wanted`.  Compared in chunks and short-
@@ -244,6 +262,31 @@ fn same_contents(file: &File, wanted: &[u8]) -> bool {
             Err(_) => return false,
         }
     }
+}
+
+/// The last look before a replacement is committed: the name must still resolve to
+/// the file that was opened, and that file must still be the version that was read.
+fn still_the_same(target: &Path, resolved: &Path, before: &Metadata) -> bool {
+    std::fs::canonicalize(target).is_ok_and(|now| now == *resolved)
+        && same_file_version(before, resolved)
+}
+
+/// True when `path` still describes `before`: the same inode on the same device, with
+/// the same size, link count and timestamps to the nanosecond.  A byte compare cannot
+/// tell any of this — a rewrite that produced the same bytes leaves the name pointing
+/// at a different inode, and `ctime` moves even when `mtime` is put back by hand.
+fn same_file_version(before: &Metadata, path: &Path) -> bool {
+    let Ok(after) = std::fs::metadata(path) else {
+        return false;
+    };
+    before.dev() == after.dev()
+        && before.ino() == after.ino()
+        && before.size() == after.size()
+        && before.nlink() == after.nlink()
+        && before.mtime() == after.mtime()
+        && before.mtime_nsec() == after.mtime_nsec()
+        && before.ctime() == after.ctime()
+        && before.ctime_nsec() == after.ctime_nsec()
 }
 
 /// The temporary a replacement is written into, next to the target and named the way
@@ -389,8 +432,44 @@ fn xattr_value(fd: std::os::fd::RawFd, name: &std::ffi::CString) -> Option<Vec<u
 /// and takes it out of the destructor's reach on the way.
 fn rename(temp: NamedTempFile, target: &Path) -> Result<(), String> {
     temp.persist(target)
-        .map_err(|err| format!("rename {}: {}", target.display(), err_message(&err.error)))?;
+        .map_err(|err| failed(target, &err.error))?;
     Ok(())
+}
+
+/// The last step for a file that was not there: `link`, not `rename`.  A link will not
+/// overwrite a name that appeared while the temporary was being written, so the writer
+/// that got there first keeps its file and this one comes back with `File exists`.  A
+/// rename would have quietly won a race nobody was watching, which is the one answer
+/// the model cannot recover from.
+///
+/// Filesystems that cannot link at all — a FAT card, one FUSE mount out of several —
+/// still have to be able to create a file, so the link is retried as a rename when the
+/// refusal is about the link rather than about the file.  On such a filesystem the race
+/// protection was never available; everywhere it is, it is used.
+fn link_new(temp: NamedTempFile, target: &Path) -> Result<(), String> {
+    if let Err(err) = std::fs::hard_link(temp.path(), target) {
+        if !link_was_unsupported(&err) {
+            return Err(failed(target, &err));
+        }
+        return rename(temp, target);
+    }
+    // Closing the handle is also the unlink of the temporary's own name: the target
+    // keeps the inode, and nothing is left behind either way.
+    temp.close().map_err(|err| failed(target, &err))
+}
+
+/// The refusals that mean "this filesystem has no link operation", as opposed to
+/// "something is wrong with this file".  `ENOTSUP` and `EOPNOTSUPP` are one value on
+/// Linux and two on macOS, so both are named and one of them is always a duplicate.
+const LINK_UNSUPPORTED: &[i32] = &[libc::EPERM, libc::ENOTSUP, libc::EOPNOTSUPP, libc::ENOSYS];
+
+fn link_was_unsupported(err: &io::Error) -> bool {
+    // `EEXIST` is the one code that must stay an error: it is the race this link
+    // exists to lose, and falling back on it would hand the race straight back.
+    // `EXDEV` is absent for a different reason — the temporary is made next to its
+    // target, so a rename could not cross the device either.
+    err.raw_os_error()
+        .is_some_and(|code| LINK_UNSUPPORTED.contains(&code))
 }
 
 /// Line spans of a buffer, counting a final line that has no terminator.  The
@@ -556,13 +635,136 @@ mod tests {
         let err = replace(text, b"edited".to_vec(), Some(b"something else".to_vec()))
             .await
             .unwrap_err();
-        assert!(err.contains("changed since it was read"), "{err}");
+        assert!(
+            err.contains("file changed while editing; read it again"),
+            "{err}"
+        );
         assert_eq!(std::fs::read(text).unwrap(), b"original");
         replace(text, b"edited".to_vec(), Some(b"original".to_vec()))
             .await
             .unwrap();
         assert_eq!(std::fs::read(text).unwrap(), b"edited");
         std::fs::remove_file(text).unwrap();
+    }
+
+    /// The wording is part of the interface: a model tuned against it knows the next
+    /// step is to read the file again, not to try the same edit a second time.
+    #[tokio::test]
+    async fn a_lost_race_is_answered_in_the_agents_words() {
+        let (path, _dir) = temp_path("wording");
+        let text = path.to_str().unwrap();
+        std::fs::write(text, b"original\n").unwrap();
+        let expected = format!("file changed while editing; read it again: {text}");
+
+        let err = replace(text, b"edited".to_vec(), Some(b"other".to_vec()))
+            .await
+            .unwrap_err();
+        assert_eq!(err, expected, "a file whose bytes moved");
+
+        // The same answer when the file is gone: an edit that read a file which is no
+        // longer there is the same race wearing a different hat.
+        std::fs::remove_file(text).unwrap();
+        let err = replace(text, b"edited".to_vec(), Some(b"original\n".to_vec()))
+            .await
+            .unwrap_err();
+        assert_eq!(err, expected, "a file that vanished");
+    }
+
+    /// The look taken just before the rename, checked without needing to win a race.
+    /// A name that moved, an inode that moved, and a file that went away are three
+    /// different ways an edit can be about something that is no longer there.
+    #[test]
+    fn the_guard_notices_a_name_that_no_longer_means_the_same_file() {
+        let scratch = tempfile::TempDir::with_prefix("ds4-helper-version-").unwrap();
+        let dir = scratch.path();
+
+        let quiet = dir.join("quiet");
+        std::fs::write(&quiet, b"bytes\n").unwrap();
+        let resolved = std::fs::canonicalize(&quiet).unwrap();
+        let before = std::fs::metadata(&quiet).unwrap();
+        assert!(
+            still_the_same(&quiet, &resolved, &before),
+            "nothing happened to it"
+        );
+
+        // Same name, same bytes, another inode: the part a byte compare cannot see.
+        let moved = dir.join("moved");
+        std::fs::write(&moved, b"bytes\n").unwrap();
+        std::fs::rename(&moved, &quiet).unwrap();
+        assert!(
+            !still_the_same(&quiet, &resolved, &before),
+            "another inode under the same name"
+        );
+
+        // A name that resolves somewhere else is not the file that was read, even to
+        // a file with the same bytes in it.
+        let elsewhere = dir.join("elsewhere");
+        std::fs::write(&elsewhere, b"bytes\n").unwrap();
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&quiet, &link).unwrap();
+        let resolved_link = std::fs::canonicalize(&link).unwrap();
+        let before_link = std::fs::metadata(&link).unwrap();
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+        assert!(
+            !still_the_same(&link, &resolved_link, &before_link),
+            "a retargeted name"
+        );
+
+        std::fs::remove_file(&quiet).unwrap();
+        assert!(
+            !still_the_same(&quiet, &resolved, &before),
+            "a name that resolves nowhere"
+        );
+    }
+
+    /// A file that appears while the temporary is being written keeps its own
+    /// contents: the last step of a new file is a link, and a link loses a race
+    /// instead of winning it.
+    #[test]
+    fn a_file_created_underneath_a_write_is_not_overwritten() {
+        let (path, _dir) = temp_path("link");
+        let text = path.to_str().unwrap();
+        // Not through `replace`: the point is to hold a finished temporary while
+        // something else creates the name it was written for.
+        let temp = create_new(&path, b"the helper wrote this\n").unwrap();
+        std::fs::write(text, b"someone else got here first\n").unwrap();
+
+        let err = link_new(temp, &path).unwrap_err();
+        assert!(err.contains("File exists"), "{err}");
+        assert_eq!(
+            std::fs::read(text).unwrap(),
+            b"someone else got here first\n"
+        );
+        // And the loser takes its temporary out with it.
+        let left: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .collect();
+        assert_eq!(left.len(), 1, "left behind: {left:?}");
+    }
+
+    /// Retrying a failed link is for a filesystem that cannot link, never for the race
+    /// the link was put there to lose: falling back on `EEXIST` would hand it straight
+    /// back.  Which half of this the branch is cannot be tried on a filesystem that
+    /// links happily, so the decision itself is what is checked here.
+    #[test]
+    fn only_a_link_the_filesystem_cannot_do_falls_back_to_the_rename() {
+        let refused = |code| io::Error::from_raw_os_error(code);
+        assert!(link_was_unsupported(&refused(libc::EPERM)), "no link here");
+        assert!(link_was_unsupported(&refused(libc::ENOTSUP)));
+        assert!(link_was_unsupported(&refused(libc::EOPNOTSUPP)));
+        assert!(link_was_unsupported(&refused(libc::ENOSYS)));
+
+        // The race, and the failures that are about the file or the disk rather than
+        // about the operation.
+        assert!(!link_was_unsupported(&refused(libc::EEXIST)), "the race");
+        assert!(!link_was_unsupported(&refused(libc::ENOENT)));
+        assert!(!link_was_unsupported(&refused(libc::ENOSPC)));
+        assert!(!link_was_unsupported(&refused(libc::EROFS)));
+        assert!(!link_was_unsupported(&refused(libc::EXDEV)));
+        // An error that never came from a filesystem cannot report on one.
+        assert!(!link_was_unsupported(&io::Error::other("no errno at all")));
     }
 
     #[tokio::test]

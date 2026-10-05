@@ -337,7 +337,10 @@ mod tests {
                 .await
                 .unwrap_err()
         };
-        assert!(stale.contains("changed since it was read"), "{stale}");
+        assert!(
+            stale.contains("file changed while editing; read it again"),
+            "{stale}"
+        );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "someone else\n");
         std::fs::remove_file(path).unwrap();
     }
