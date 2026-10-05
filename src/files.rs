@@ -311,7 +311,70 @@ fn copy_metadata(
             )
         };
     }
+    #[cfg(target_os = "linux")]
+    {
+        // Linux has no single call that copies "the rest" of a file's metadata, but
+        // it keeps both the extended attributes and the POSIX ACL in one place: the
+        // ACL is `system.posix_acl_access`, an attribute like any other.  So the
+        // attributes are carried over, and the ACL travels with them.  The same
+        // bargain as the macOS branch: an attribute the kernel will not let this
+        // process write — `security.selinux` and `trusted.*` are the usual ones — is
+        // skipped rather than costing the edit.
+        copy_xattrs(source.as_raw_fd(), temp.as_raw_fd());
+    }
     Ok(temp)
+}
+
+/// Carries every extended attribute from one open file to another, forgetting the
+/// ones this process has no business setting.  Best effort by design: the bytes and
+/// the mode are the contract, and an ACL that could not be reproduced is worth
+/// reporting to whoever looks, not worth losing the write over.
+#[cfg(target_os = "linux")]
+fn copy_xattrs(from: std::os::fd::RawFd, to: std::os::fd::RawFd) {
+    for name in xattr_names(from) {
+        if let Some(value) = xattr_value(from, &name) {
+            // flags 0: create or replace, which is all a copy needs.
+            unsafe { libc::fsetxattr(to, name.as_ptr(), value.as_ptr().cast(), value.len(), 0) };
+        }
+    }
+}
+
+/// The attribute names on an open file.  `flistxattr` answers with one buffer of
+/// NUL-separated names, and with the size it would need when given none of it.
+#[cfg(target_os = "linux")]
+fn xattr_names(fd: std::os::fd::RawFd) -> Vec<std::ffi::CString> {
+    let needed = unsafe { libc::flistxattr(fd, std::ptr::null_mut(), 0) };
+    if needed <= 0 {
+        return Vec::new();
+    }
+    let mut buffer = vec![0u8; needed as usize];
+    let read = unsafe { libc::flistxattr(fd, buffer.as_mut_ptr().cast(), buffer.len()) };
+    if read <= 0 {
+        return Vec::new();
+    }
+    buffer.truncate(read as usize);
+    buffer
+        .split(|byte| *byte == 0)
+        .filter(|name| !name.is_empty())
+        .filter_map(|name| std::ffi::CString::new(name.to_vec()).ok())
+        .collect()
+}
+
+/// One attribute's value, or nothing when it cannot be read or vanished in between.
+#[cfg(target_os = "linux")]
+fn xattr_value(fd: std::os::fd::RawFd, name: &std::ffi::CString) -> Option<Vec<u8>> {
+    let needed = unsafe { libc::fgetxattr(fd, name.as_ptr(), std::ptr::null_mut(), 0) };
+    if needed < 0 {
+        return None;
+    }
+    let mut value = vec![0u8; needed as usize];
+    let read =
+        unsafe { libc::fgetxattr(fd, name.as_ptr(), value.as_mut_ptr().cast(), value.len()) };
+    if read < 0 {
+        return None;
+    }
+    value.truncate(read as usize);
+    Some(value)
 }
 
 /// Moves the temporary onto the target, which is what makes the replacement atomic,
@@ -413,6 +476,45 @@ mod tests {
         let left = temp.path().to_path_buf();
         drop(temp);
         assert!(!left.exists(), "the temporary outlived its handle");
+    }
+
+    /// What an `edit` did not touch comes across with the file.  On Linux this is
+    /// also how a POSIX ACL travels, since the ACL is one of these attributes.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn extended_attributes_survive_a_replace() {
+        use std::ffi::CString;
+        use std::os::fd::AsRawFd;
+
+        let (path, _dir) = temp_path("xattr");
+        std::fs::write(&path, b"one\n").unwrap();
+        let name = CString::new("user.ds4-test").unwrap();
+        let target = CString::new(path.to_str().unwrap()).unwrap();
+        let value = b"carried over";
+        let set = unsafe {
+            libc::setxattr(
+                target.as_ptr(),
+                name.as_ptr(),
+                value.as_ptr().cast(),
+                value.len(),
+                0,
+            )
+        };
+        if set != 0 {
+            // Not every filesystem accepts user attributes — tmpfs only learned it
+            // recently — and one that will not hold one is not a verdict on this code.
+            return;
+        }
+
+        replace(path.to_str().unwrap(), b"two\n".to_vec(), None)
+            .await
+            .unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        assert_eq!(
+            xattr_value(file.as_raw_fd(), &name).as_deref(),
+            Some(&value[..]),
+            "the attribute did not survive the replacement"
+        );
     }
 
     #[tokio::test]

@@ -114,6 +114,18 @@ naming because they are the sort of thing that would otherwise be a surprise:
   ended there. `read` does not add the note, since it already ends with the offsets to
   resume from.
 
+## Platforms
+
+macOS and Linux are both supported, and they differ in one place worth naming: the
+metadata that comes across when a file is replaced.  macOS has a call that copies the
+rest of a file in one go, and it is used for the ACL and the extended attributes.
+Linux has no such call, but it keeps the POSIX ACL as an attribute of its own
+(`system.posix_acl_access`), so carrying the attributes across carries the ACL with
+them.  Both are best effort: a label this process may not write — an SELinux context,
+a `trusted.*` attribute — is skipped, and the write still succeeds.  A filesystem that
+will not hold attributes at all is not a failure of the write either, and the test that
+checks this quietly does nothing there.
+
 ## Tests
 
 ```sh
