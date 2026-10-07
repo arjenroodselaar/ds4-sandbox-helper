@@ -12,6 +12,7 @@
 //! either case the agent is better off being told now than waiting for an answer that
 //! would be a guess.
 
+use std::env::current_dir;
 use std::io::ErrorKind;
 
 use tokio::io::AsyncRead;
@@ -38,6 +39,23 @@ pub enum Outcome {
     Fault(String),
 }
 
+/// What the startup notice names besides the version: the directory every relative
+/// path resolves in, the read size that applies to a sender stating no limit, and
+/// whether `edit` accepts an `[upto]` marker.  The directory is left out rather
+/// than losing the hello if the process cannot say where it is.
+fn startup_details(config: &Config) -> String {
+    let mut details = Vec::new();
+    if let Ok(dir) = current_dir() {
+        details.push(format!("dir {}", dir.display()));
+    }
+    details.push(format!("read_lines default {}", config.read_lines));
+    details.push(format!(
+        "upto marker {}",
+        if config.edit_upto { "on" } else { "off" }
+    ));
+    details.join(", ")
+}
+
 pub async fn serve<R, W>(reader: R, mut writer: W, config: Config) -> Outcome
 where
     R: AsyncRead + Unpin,
@@ -49,14 +67,16 @@ where
     // Diagnostics travel as id-0 notices, which the agent mirrors into its sandbox
     // log next to the helper's stderr.  The alternative, printing to stdout, would be
     // a frame the agent cannot parse.
+    //
+    // The first one is the startup handshake, written before anything is read back:
+    // the agent blocks on the word `ready` rather than loading a model for a sandbox
+    // that does not exist, echoes this helper's stderr until the notice arrives, and
+    // then prints this line as the sandbox's hello.  The word is the contract; the
+    // rest is for whoever is watching the run start.
     let startup = notice(&format!(
-        // The read size is named as a default because that is all it is: the agent
-        // sends the real number with each request, and this only matters to a sender
-        // that does not.
-        "ds4-sandbox-helper {} ready: read_lines default {}, edit_upto={}",
+        "ds4-sandbox-helper {} ready: {}",
         env!("CARGO_PKG_VERSION"),
-        config.read_lines,
-        config.edit_upto
+        startup_details(&config)
     ));
     if write(&mut writer, &startup).await.is_err() {
         session.finish().await;

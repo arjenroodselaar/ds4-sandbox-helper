@@ -86,11 +86,21 @@ impl Helper {
             stdout,
             next_id: 0,
         };
-        // The first frame is the helper's own startup notice, and there is nothing
-        // else on the stream yet: waiting past it here would wait for a reply that no
-        // request has asked for.
+        // The first frame is the helper's own startup notice, and it has to arrive
+        // before a byte is written: the agent blocks on the word ready, so a hello
+        // that waited for a request would be a startup that never ends.
         let first = helper.one().await;
+        assert_eq!(
+            first["id"].as_i64(),
+            Some(0),
+            "expected a notice first, got {first}"
+        );
         assert_eq!(first["type"], "log", "expected a notice first, got {first}");
+        let hello = first["text"].as_str().unwrap_or_default();
+        assert!(
+            hello.to_ascii_lowercase().contains("ready"),
+            "the startup notice has to contain the word ready: {hello}"
+        );
         helper
     }
 

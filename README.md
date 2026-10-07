@@ -24,6 +24,29 @@ cargo build --release
 ds4-agent --sandbox 'docker run -i --rm -v "$PWD:/w" -w /w helper' …
 ```
 
+## Startup
+
+The first frame is the helper's own, written before a byte of a request is read:
+
+```
+132
+{"id":0,"text":"ds4-sandbox-helper 0.1.0 ready: dir /home/ds4-sandbox-helper, read_lines default 120, upto marker off","type":"log"}
+```
+
+The word `ready` is what the agent blocks on, and it blocks before loading a
+model. The wait ends when that word arrives, when the process dies, or when it
+sends something that is not a frame. Everything else in the line is for the user:
+the agent prints it as `sandbox: …` beside its own model-loading messages, so a
+run says which sandbox is answering, in which directory, with which settings.
+
+Until that notice arrives the agent also echoes the helper's stderr a line at a
+time with the same `sandbox: ` prefix, which is how a bad option or a directory
+that does not exist reaches the terminal instead of a bare exit code. After it,
+stderr is diagnostics again: kept as a tail, mirrored to the agent's trace, and
+reported when the sandbox dies. Printing to stdout outside a frame is a protocol
+fault, hello included, and a startup that never reaches the notice leaves the
+agent waiting for as long as the process lives.
+
 ## Options
 
 | Option | Env | Default |
