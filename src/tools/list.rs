@@ -28,8 +28,11 @@ pub async fn list(request: &Request) -> Result<String, String> {
     let mut more = false;
     loop {
         if shown >= MAX_ENTRIES {
-            // The cap counts printed entries, so a skipped one still means there was more.
-            more = true;
+            // The note means an entry was left out, not that the cap was reached, so
+            // read one more and let whether it exists decide.  The C agent stops with
+            // the 301st `readdir` result in hand and says nothing when the directory
+            // ended at the cap.  A failed read ends the directory there too.
+            more = matches!(entries.next_entry().await, Ok(Some(_)));
             break;
         }
         let Ok(Some(entry)) = entries.next_entry().await else {
@@ -108,23 +111,57 @@ mod tests {
         assert!(err.starts_with("opendir failed: "), "{err}");
     }
 
+    /// `count` plain files in a directory of their own.  The guard is what keeps the
+    /// directory alive, so a caller holds it for as long as it uses the path.
+    fn dir_with_files(count: usize) -> (std::path::PathBuf, tempfile::TempDir) {
+        let temp = tempfile::tempdir().unwrap();
+        for index in 0..count {
+            std::fs::write(temp.path().join(format!("f{index}")), b"x").unwrap();
+        }
+        (temp.path().to_path_buf(), temp)
+    }
+
+    fn entry_lines(text: &str) -> usize {
+        text.lines().filter(|l| l.starts_with("- ")).count()
+    }
+
+    const NOTE: &str = "... more entries omitted ...";
+
+    /// Past the cap the note is a promise that something was left out, and it is true.
     #[tokio::test]
     async fn the_entry_cap_says_so() {
-        let temp = tempfile::tempdir().unwrap();
-        let dir = temp.path();
-        for index in 0..340 {
-            std::fs::write(dir.join(format!("f{index}")), b"x").unwrap();
-        }
+        let (dir, _dir) = dir_with_files(MAX_ENTRIES + 40);
         let text = list(&request(dir.to_str().unwrap())).await.unwrap();
-        assert_eq!(
-            text.lines().filter(|l| l.starts_with("- ")).count(),
-            MAX_ENTRIES
-        );
+        assert_eq!(entry_lines(&text), MAX_ENTRIES);
+        assert!(text.contains(NOTE), "tail: {}", tail(&text));
+    }
+
+    /// The boundary the cap is decided at.  300 are printed and a 301st entry is still
+    /// unread, which is the entry the note refers to.
+    #[tokio::test]
+    async fn one_entry_past_the_cap_is_worth_the_note() {
+        let (dir, _dir) = dir_with_files(MAX_ENTRIES + 1);
+        let text = list(&request(dir.to_str().unwrap())).await.unwrap();
+        assert_eq!(entry_lines(&text), MAX_ENTRIES);
         assert!(
-            text.contains("... more entries omitted ..."),
+            text.ends_with(&format!("{NOTE}\n")),
             "tail: {}",
             tail(&text)
         );
+    }
+
+    /// A directory that happens to end at the cap leaves nothing out, so the note would
+    /// be a lie.  The C agent stops with `readdir`'s next result in hand and prints
+    /// nothing here, and the answers are meant to be the same text.
+    #[tokio::test]
+    async fn a_directory_that_ends_exactly_at_the_cap_is_not_called_incomplete() {
+        let (dir, _dir) = dir_with_files(MAX_ENTRIES);
+        let text = list(&request(dir.to_str().unwrap())).await.unwrap();
+        assert_eq!(entry_lines(&text), MAX_ENTRIES);
+        assert!(!text.contains("more entries"), "tail: {}", tail(&text));
+        // The last line is an entry, not a note.  Order is the filesystem's, so the
+        // name is not pinned down, but nothing follows the 300th line.
+        assert!(text.lines().last().is_some_and(|l| l.starts_with("- ")));
     }
 
     fn tail(text: &str) -> String {
