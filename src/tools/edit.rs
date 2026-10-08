@@ -1,12 +1,16 @@
-//! `edit`: replace one uniquely-anchored span of a file.
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+//! `edit` replaces one uniquely-anchored span of a file.
 //!
 //! Three properties, all inherited from the C agent: `old` must match exactly once;
 //! the write goes through the same atomic replace as `write`; and the file is checked
 //! against the bytes that were searched, so an edit computed from a stale read is
 //! refused rather than applied over someone else's change.
 //!
-//! The result text lets the model keep using line numbers it already has: which lines
-//! were touched, and how far the lines after them shifted.
+//! The result text lets the model keep using line numbers it already has.  It says
+//! which lines were touched, and how far the lines after them shifted.
 
 use std::fmt::Write;
 
@@ -31,7 +35,7 @@ pub async fn edit(request: &Request, allow_upto: bool) -> Result<String, String>
     if old.is_empty() {
         return Err("edit requires non-empty old text".into());
     }
-    // An empty `new` is a deletion, which is a real edit; a missing one is the model
+    // An empty `new` is a deletion, which is a real edit.  A missing one is the model
     // leaving out a parameter.
     let Some(new) = request.arg("new") else {
         return Err("edit requires new text".into());
@@ -89,7 +93,7 @@ pub async fn edit(request: &Request, allow_upto: bool) -> Result<String, String>
         );
     }
 
-    // The guard is the bytes the anchor was searched in: if the file moved, this
+    // The guard is the bytes the anchor was searched in.  If the file moved, this
     // offset points somewhere else.
     files::replace(path, replacement, Some(data)).await?;
     Ok(out.into_string())
@@ -225,7 +229,7 @@ fn append_context(
 fn append_line(out: &mut Budget, data: &[u8], span: (usize, usize), line: usize) {
     let content = trim_line_end(&data[span.0..span.1]);
     let _ = write!(out, "{line} ");
-    // The bytes are the file's; a file that is not valid UTF-8 still has to be
+    // The bytes are the file's.  A file that is not valid UTF-8 still has to be
     // reportable.
     out.write_str(&String::from_utf8_lossy(content)).ok();
     let _ = writeln!(out);
@@ -340,8 +344,8 @@ mod tests {
 
     #[tokio::test]
     async fn adding_lines_reports_the_shift_so_old_numbers_are_not_trusted() {
-        // Words rather than bare numbers: "5" also occurs inside "15" and "25",
-        // and an anchor that is not unique is refused before anything is written.
+        // Words rather than bare numbers.  "5" also occurs inside "15" and "25", and
+        // an anchor that is not unique is refused before anything is written.
         let body = (1..=30).map(|n| format!("row {n}\n")).collect::<String>();
         let (path, _dir) = temp("shift", &body);
         let text = edit(

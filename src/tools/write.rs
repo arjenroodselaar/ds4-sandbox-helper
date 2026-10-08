@@ -1,4 +1,8 @@
-//! `write`: replace a whole file.
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+//! `write` replaces a whole file.
 
 use crate::files;
 use crate::protocol::Request;
@@ -8,7 +12,7 @@ pub async fn write(request: &Request) -> Result<String, String> {
         return Err("write requires path".into());
     };
     let Some(content) = request.arg("content") else {
-        // "" is a request to truncate; an absent argument is the model forgetting it.
+        // "" is a request to truncate.  An absent argument is the model forgetting it.
         return Err("write requires content".into());
     };
     files::replace(path, content.as_bytes().to_vec(), None).await?;
@@ -24,7 +28,7 @@ mod tests {
         parse_request(format!(r#"{{"id":1,"tool":"write","args":{{{args}}}}}"#).as_bytes()).unwrap()
     }
 
-    /// A file path in a self-deleting directory; the caller keeps the directory.
+    /// A file path in a self-deleting directory.  The caller keeps the directory.
     fn temp(tag: &str) -> (String, tempfile::TempDir) {
         let dir = tempfile::TempDir::with_prefix(format!("ds4-helper-write-{tag}-")).unwrap();
         (dir.path().join("file").to_str().unwrap().to_string(), dir)

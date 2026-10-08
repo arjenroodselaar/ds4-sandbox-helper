@@ -1,4 +1,8 @@
-//! `bash`, `bash_status` and `bash_stop`: shell commands that outlive one request.
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+//! `bash`, `bash_status` and `bash_stop` run shell commands that outlive one request.
 //!
 //! A command that takes four minutes must not make the model wait four minutes to
 //! learn that it started.  So the command runs in its own process group with its
@@ -41,7 +45,7 @@ const MAX_TIMEOUT_SEC: f64 = 86_400.0;
 /// How long a stopped job is given to notice the request before it is killed.
 const STOP_GRACE: Duration = Duration::from_secs(1);
 /// How long to wait for the reaper when `bash_stop` was not told how long to wait.
-/// It is a ceiling, not a delay: the answer goes out the moment the job is reaped.
+/// It is a ceiling, not a delay.  The answer goes out the moment the job is reaped.
 const STOP_WAIT: Duration = Duration::from_secs(5);
 
 /// What the watcher task knows about a job, cloned into every observation.
@@ -101,7 +105,7 @@ pub struct Jobs {
 }
 
 impl Jobs {
-    /// By id, falling back to pid only when no id was given: a pid is not a stable
+    /// By id, falling back to pid only when no id was given.  A pid is not a stable
     /// handle once the job has been reaped.
     fn find_index(&self, id: i32, pid: i64) -> Option<usize> {
         self.list.iter().position(|job| {
@@ -110,7 +114,7 @@ impl Jobs {
     }
 
     async fn remove(&mut self, id: i32) {
-        // A finished job's spool file goes with it: the agent has already seen the
+        // A finished job's spool file goes with it.  The agent has already seen the
         // output, and /tmp is not this process's to keep.
         if let Some(index) = self.list.iter().position(|job| job.id == id) {
             let job = self.list.remove(index);
@@ -120,7 +124,7 @@ impl Jobs {
 }
 
 /// Starts a command and reports the first snapshot, waiting at most `refresh_sec` for
-/// a command that finishes quickly.  The shell is the one settled on at startup: a
+/// a command that finishes quickly.  The shell is the one settled on at startup.  A
 /// model that could name an interpreter would eventually name one that is not there.
 pub async fn start(request: &Request, jobs: &mut Jobs, shell: &Path) -> Result<String, String> {
     let Some(command) = request.arg("command").filter(|c| !c.is_empty()) else {
@@ -153,9 +157,9 @@ pub async fn start(request: &Request, jobs: &mut Jobs, shell: &Path) -> Result<S
         // The one flag every shell worth choosing understands.
         .arg("-c")
         .arg(command)
-        // The helper's stdin is the request stream; a command must not eat a frame.
+        // The helper's stdin is the request stream.  A command must not eat a frame.
         .stdin(Stdio::null())
-        // Plain descriptors: the helper never reads them back.
+        // Plain descriptors, because the helper never reads them back.
         .stdout(Stdio::from(file.into_std().await))
         .stderr(Stdio::from(stderr_file.into_std().await))
         // A forked command leaves children behind, and a survivor keeps writing into
@@ -252,7 +256,7 @@ pub async fn stop(request: &Request, jobs: &mut Jobs) -> Result<String, String> 
     let Some(index) = jobs.find_index(id, pid) else {
         return Err(format!("bash job not found: job={id} pid={pid}"));
     };
-    // A stop's own patience is a ceiling, not a delay: with no `refresh_sec` it still
+    // A stop's own patience is a ceiling, not a delay.  With no `refresh_sec` it still
     // allows a second, and a job that dies at once is reported at once.
     let refresh = request.arg_or("refresh_sec", 0, 0, 3600);
     let patience = if refresh > 0 {
@@ -294,7 +298,7 @@ fn requested_job(request: &Request) -> (i32, i64) {
 }
 
 /// The exit code, 128+signal when a signal ended the process, or -1 when neither is
-/// known: a stopped job reads as 143, which is what a shell user expects.
+/// known.  A stopped job reads as 143, which is what a shell user expects.
 fn exit_status_of(exit: &std::process::ExitStatus) -> i32 {
     match exit.code() {
         Some(code) => code,
@@ -356,7 +360,7 @@ async fn observation(job: &mut Job) -> String {
         let (head, shown, byte_limited) = read_head(&job.path).await;
         let truncated = byte_limited || lines > shown;
         if !status.running && !truncated {
-            // Small and finished: show it as the answer, not as an excerpt of a file.
+            // Small and finished, so this is the answer rather than an excerpt of a file.
             let _ = write!(out, "<output>\n{head}");
             if !head.is_empty() && !head.ends_with('\n') {
                 let _ = writeln!(out);
@@ -402,7 +406,7 @@ async fn observation(job: &mut Job) -> String {
 /// The file a job's output is spooled into, named `ds4_agent_output_XXXXXX` like the
 /// agent's own, so a sandbox log and an agent log say the same thing.
 ///
-/// Owner read/write only, and not deleted on exit: the model reads it back by path
+/// Owner read/write only, and not deleted on exit.  The model reads it back by path
 /// long after the command is gone.
 async fn spool_file() -> Result<(File, PathBuf), String> {
     tokio::task::spawn_blocking(|| {
@@ -419,7 +423,7 @@ fn kill_group(pid: u32, signal: i32) {
     if pid == 0 {
         return;
     }
-    // Negative on purpose: the whole group, not only the shell that exec'd.
+    // Negative on purpose, so the whole group goes and not only the shell that exec'd.
     unsafe { libc::killpg(pid as i32, signal) };
 }
 

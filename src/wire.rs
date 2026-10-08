@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Framing for both directions of the sandbox pipe:
 //!
 //! ```text
@@ -6,7 +10,7 @@
 //!
 //! A counted length lets a payload carry any byte a JSON string can.  The price is
 //! that a lost or extra byte cannot be resynchronised on, so most failures here end
-//! the session; an oversized frame is the exception, since it can be counted out.
+//! the session.  An oversized frame is the exception, since it can be counted out.
 
 use std::fmt;
 use std::io;
@@ -34,7 +38,7 @@ pub enum Frame {
 /// Why the stream can no longer be read as frames.  Every variant ends the session.
 #[derive(Debug)]
 pub enum WireError {
-    /// End of stream where a header had already begun: a truncated frame.
+    /// End of stream where a header had already begun, which is a truncated frame.
     EofMidHeader,
     /// End of stream where payload bytes were still owed.
     EofMidPayload {
@@ -122,7 +126,7 @@ where
     Ok(Some(Frame::Payload(payload)))
 }
 
-/// The digits before the newline.  Leading zeros are accepted; an empty, signed or
+/// The digits before the newline.  Leading zeros are accepted.  An empty, signed or
 /// non-digit header is not a count, nor is one too large for `usize`.
 fn parse_header(bytes: &[u8]) -> Option<usize> {
     if bytes.is_empty() || bytes.len() > 20 {
@@ -146,7 +150,7 @@ where
     let header = format!("{}\n", payload.len());
     writer.write_all(header.as_bytes()).await?;
     writer.write_all(payload).await?;
-    // The agent waits on this pipe; a buffered frame looks like a stuck sandbox.
+    // The agent waits on this pipe, so a buffered frame looks like a stuck sandbox.
     writer.flush().await
 }
 

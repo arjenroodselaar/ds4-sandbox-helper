@@ -1,9 +1,13 @@
-//! End-to-end tests: the real binary, real pipes, real files, real processes.
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+//! End-to-end tests run the real binary, with real pipes, real files and real processes.
 //!
 //! These drive the helper exactly as `ds4-agent --sandbox` does — framed JSON both
 //! ways — so they check what unit tests cannot: that byte counts agree with payloads,
 //! that every request gets a reply, and that a tool's answer keeps its shape through
-//! the protocol.  The codec is written again here on purpose: a test that imported the
+//! the protocol.  The codec is written again here on purpose.  A test that imported the
 //! binary's own encoder could not catch an encoder that disagrees with the spec.
 
 use std::os::unix::fs::PermissionsExt;
@@ -71,7 +75,7 @@ impl Helper {
             .env_remove("DS4_SHELL")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            // Diagnostics stay on the inherited stderr: the agent's contract is that
+            // Diagnostics stay on the inherited stderr.  The agent's contract is that
             // nothing but frames ever reaches stdout.
             .stderr(Stdio::inherit())
             .spawn()
@@ -87,7 +91,7 @@ impl Helper {
             stdout,
             next_id: 0,
         };
-        // The startup notice has to arrive before a byte is written: the agent blocks
+        // The startup notice has to arrive before a byte is written.  The agent blocks
         // on the word ready, so a hello that waited for a request would never start.
         let first = helper.one().await;
         assert_eq!(
@@ -137,13 +141,13 @@ impl Helper {
     }
 
     /// Sends a request and returns the reply.  Every argument is a string, which is
-    /// what the agent sends: numbers and booleans included.
+    /// what the agent sends, numbers and booleans included.
     async fn call(&mut self, tool: &str, args: serde_json::Value) -> serde_json::Value {
         self.request(serde_json::json!({ "tool": tool, "args": args }))
             .await
     }
 
-    /// Sends a request frame carrying more than a tool and its arguments: the agent
+    /// Sends a request frame carrying more than a tool and its arguments.  The agent
     /// puts what a tool cannot work out for itself (the model's context size, say) at
     /// the top level, beside `id` rather than inside `args`.
     async fn request(&mut self, mut frame: serde_json::Value) -> serde_json::Value {
@@ -192,7 +196,7 @@ impl Helper {
             .to_string()
     }
 
-    /// Closes stdin and waits: the helper should treat that as the end of the run.
+    /// Closes stdin and waits.  The helper should treat that as the end of the run.
     async fn finish(self) -> std::process::ExitStatus {
         let Helper {
             mut child,
@@ -200,7 +204,7 @@ impl Helper {
             stdout,
             ..
         } = self;
-        // stdout has to go before stdin: some systems wake a blocked reader before
+        // stdout has to go before stdin.  Some systems wake a blocked reader before
         // delivering EOF the other way, and the helper would keep reading frames.
         drop(stdout);
         drop(stdin);
@@ -208,7 +212,7 @@ impl Helper {
     }
 }
 
-/// A directory for one test to make its mess in; the caller keeps it alive.
+/// A directory for one test to make its mess in.  The caller keeps it alive.
 fn scratch(tag: &str) -> (std::path::PathBuf, tempfile::TempDir) {
     let dir = tempfile::TempDir::with_prefix(format!("ds4-helper-e2e-{tag}-"))
         .expect("scratch directory");
@@ -479,9 +483,9 @@ async fn a_slow_command_keeps_running_until_it_is_stopped() {
     helper.finish().await;
 }
 
-/// What `refresh_sec` means on a stop: how long the helper may take, not how long it
-/// takes.  A command that ignores `SIGTERM` is killed by the follow-up and answered
-/// when it is reaped, not at the deadline.
+/// What `refresh_sec` means on a stop.  It is how long the helper may take, not how
+/// long it takes.  A command that ignores `SIGTERM` is killed by the follow-up and
+/// answered when it is reaped, not at the deadline.
 #[tokio::test]
 async fn the_wait_a_stop_asks_for_is_a_ceiling_not_a_delay() {
     let mut helper = Helper::start(&[]).await;
@@ -539,7 +543,7 @@ async fn a_command_that_ignores_its_deadline_is_killed() {
 
 #[tokio::test]
 async fn a_shell_cannot_read_the_request_stream() {
-    // The helper's stdin is the agent's frame stream: a command that inherited it
+    // The helper's stdin is the agent's frame stream.  A command that inherited it
     // would eat the next request and desynchronise the session.
     let mut helper = Helper::start(&[]).await;
     let text = helper
@@ -559,8 +563,9 @@ async fn a_shell_cannot_read_the_request_stream() {
     helper.finish().await;
 }
 
-/// Which shell executes a command is settled when the helper starts, and `$0` is the
-/// cheapest way to ask a shell which shell it is: the name it was started with.
+/// Which shell executes a command is settled when the helper starts.  `$0` is the
+/// cheapest way to ask a shell which shell it is, because `$0` is the name it was
+/// started with.
 #[tokio::test]
 async fn a_command_is_executed_with_bash_when_nothing_is_chosen() {
     let expected = if Path::new("/bin/bash").exists() {
@@ -585,13 +590,13 @@ async fn a_shell_named_without_a_slash_is_resolved_by_the_exec_call() {
     let answer = helper
         .ok("bash", serde_json::json!({"command": "echo $0"}))
         .await;
-    // The name asked for rather than the one PATH found: proof the shell came from
-    // the option.
+    // The name asked for rather than the one PATH found.  That is proof the shell came
+    // from the option.
     assert!(answer.contains("<output>\nsh\n</output>"), "{answer}");
     helper.finish().await;
 }
 
-/// A script that is not a shell at all is the clearest proof of the choice: it answers
+/// A script that is not a shell at all is the clearest proof of the choice.  It answers
 /// with what it was handed, and only the shell named at startup hands it over that way.
 #[tokio::test]
 async fn the_shell_named_at_startup_is_the_one_used_to_execute_a_command() {
@@ -640,7 +645,7 @@ async fn a_request_for_an_unknown_tool_is_answered_not_ignored() {
         .fail("view_image", serde_json::json!({"path": "x"}))
         .await;
     assert_eq!(error, "unknown tool: view_image");
-    // The session survives it: an error is an answer, not a fault.
+    // The session survives it.  An error is an answer, not a fault.
     let ok = helper
         .ok("bash", serde_json::json!({"command": "true"}))
         .await;
@@ -657,7 +662,7 @@ async fn garbage_on_stdin_ends_the_session_with_a_reason() {
         .spawn()
         .expect("start the helper");
     let mut stdin = child.stdin.take().unwrap();
-    // Not a byte count at all: there is no way to know where the next frame starts.
+    // Not a byte count at all.  There is no way to know where the next frame starts.
     stdin.write_all(b"this is not a frame\n").await.unwrap();
     stdin.flush().await.unwrap();
     let status = child.wait().await.expect("wait");
@@ -708,15 +713,15 @@ async fn a_relative_path_is_answered_from_the_directory_asked_for_at_start() {
         .await;
     assert!(answer.contains("one"), "{answer}");
 
-    // A shell started by `bash` begins in the same place: no command has to name the
-    // root of the session.
+    // A shell started by `bash` begins in the same place, so no command has to name
+    // the root of the session.
     let answer = helper
         .ok("bash", serde_json::json!({"command": "cat inside.txt"}))
         .await;
     assert!(answer.contains("one"), "{answer}");
 
-    // An absolute path still means what it says: the directory is where relative
-    // ones start, not a wall around the session.
+    // An absolute path still means what it says.  The directory is where relative ones
+    // start, not a wall around the session.
     let answer = helper
         .ok("read", serde_json::json!({"path": "/etc/passwd"}))
         .await;
@@ -724,7 +729,7 @@ async fn a_relative_path_is_answered_from_the_directory_asked_for_at_start() {
     helper.finish().await;
 }
 
-/// A directory that cannot be worked in is a mistake in the command line: the helper
+/// A directory that cannot be worked in is a mistake in the command line.  The helper
 /// leaves before reading a frame, saying the agent's own complaint on stderr.
 #[tokio::test]
 async fn a_chdir_that_cannot_be_done_stops_before_the_first_frame() {
@@ -813,7 +818,8 @@ async fn the_read_size_that_comes_with_the_request_wins() {
     assert!(text.contains("lines 1-7 (partial read)"), "{text}");
 
     // `more` takes its size from the same place, so a resumed read does not change
-    // width mid-file.  `max_bytes` is a cap this helper does not implement: ignored.
+    // width mid-file.  `max_bytes` is a cap this helper does not implement, so it is
+    // ignored.
     let resumed = helper
         .request(
             serde_json::json!({"tool":"more","limits":{"read_lines":2,"max_bytes":100},"args":{}}),
@@ -828,7 +834,7 @@ async fn the_read_size_that_comes_with_the_request_wins() {
         .await;
     assert!(untold.contains("lines 1-3 (partial read)"), "{untold}");
 
-    // The size is capped: a frame may ask for a lot, but not for everything.  The
+    // The size is capped.  A frame may ask for a lot, but not for everything.  The
     // ceiling is written out here because a test of a binary cannot import it.
     const CAP: usize = 500;
     let greedy = helper
@@ -848,8 +854,8 @@ async fn the_read_size_that_comes_with_the_request_wins() {
         &text[text.len().saturating_sub(400)..]
     );
 
-    // A number that is not a number is treated as absent, not as an error: the
-    // model does not write this field, and a broken sender should still get read.
+    // A number that is not a number is treated as absent, not as an error.  The model
+    // does not write this field, and a broken sender should still get read.
     let junk = helper
         .request(
             serde_json::json!({"tool":"read","limits":{"read_lines":"lots"},"args":{"path":path}}),

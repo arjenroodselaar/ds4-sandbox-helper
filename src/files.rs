@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! File access shared by the read, write, edit, search and list tools.
 //!
 //! Two rules from the C agent carry over, both about not destroying something the
@@ -21,7 +25,7 @@ use std::path::Path;
 
 use tempfile::NamedTempFile;
 
-/// Largest file a tool will hold in memory: `edit` needs the whole file to prove that
+/// Largest file a tool will hold in memory.  `edit` needs the whole file to prove that
 /// its `old` selector is unique, and an unbounded read turns a wrong path into a crash.
 pub const MAX_FILE_BYTES: usize = 16 * 1024 * 1024;
 
@@ -51,8 +55,8 @@ where
         .unwrap_or_else(|err| Err(did_not_finish(&err)))
 }
 
-/// A panic inside a blocking body, or a runtime torn down mid-write: a failed tool
-/// rather than a dead process, since the frame stream still works.
+/// A panic inside a blocking body, or a runtime torn down mid-write, becomes a failed
+/// tool.  The frame stream still works, so the process is worth keeping.
 fn did_not_finish(err: &tokio::task::JoinError) -> String {
     format!("file operation did not finish: {err}")
 }
@@ -131,7 +135,7 @@ fn errno_message(code: i32) -> String {
 
 /// Writes `data` to `path`, replacing it atomically.
 ///
-/// With `expected`, the current contents must match it exactly: `edit` passes the
+/// With `expected`, the current contents must match it exactly.  `edit` passes the
 /// bytes it read when it found the `old` selector, so a file that changed between
 /// reading and writing is reported instead of silently overwritten.
 pub async fn replace(path: &str, data: Vec<u8>, expected: Option<Vec<u8>>) -> Result<(), String> {
@@ -147,7 +151,7 @@ fn replace_blocking(path: &str, data: &[u8], expected: Option<&[u8]>) -> Result<
         Err(err) => return Err(err_message(&err)),
     };
 
-    // Nothing to clean up: the temporary deletes itself on every path that did not
+    // Nothing to clean up.  The temporary deletes itself on every path that did not
     // reach the rename.
     replace_inner(target, existing.as_ref(), data, expected)
 }
@@ -181,7 +185,7 @@ fn replace_inner(
             return Err(changed(target));
         }
         let temp = copy_metadata(&source, data, &resolved, mode)?;
-        // The last look before committing.  Matching bytes are not enough: a writer
+        // The last look before committing.  Matching bytes are not enough.  A writer
         // that replaced the file with identical content moved a different inode into
         // the name, and this edit would replace a file nobody had read.
         if !still_the_same(target, &resolved, &source_meta) {
@@ -193,14 +197,14 @@ fn replace_inner(
     }
 
     if expected.is_some() {
-        // The file the edit read is gone: the same race, the same answer.
+        // The file the edit read is gone.  That is the same race, and the same answer.
         return Err(changed(target));
     }
     link_new(create_new(target, data)?, target)
 }
 
-/// What the agent says when the file is not the one the edit was worked out against:
-/// the agent's own wording, whose useful next step is to read the file again.
+/// What the agent says when the file is not the one the edit was worked out against.
+/// It is the agent's own wording, and the useful next step it gives is to read again.
 fn changed(target: &Path) -> String {
     format!(
         "file changed while editing; read it again: {}",
@@ -250,9 +254,9 @@ fn still_the_same(target: &Path, resolved: &Path, before: &Metadata) -> bool {
         && same_file_version(before, resolved)
 }
 
-/// True when `path` still describes `before`: the same inode on the same device, with
-/// the same size, link count and timestamps.  A byte compare cannot see this — a
-/// rewrite with identical bytes leaves a different inode behind the name.
+/// True when `path` still describes `before`, meaning the same inode on the same
+/// device with the same size, link count and timestamps.  A byte compare cannot see
+/// this — a rewrite with identical bytes leaves a different inode behind the name.
 fn same_file_version(before: &Metadata, path: &Path) -> bool {
     let Ok(after) = std::fs::metadata(path) else {
         return false;
@@ -300,7 +304,7 @@ fn create_new(target: &Path, data: &[u8]) -> Result<NamedTempFile, String> {
     write_temp(target, data, 0o666)
 }
 
-/// Replaces an existing file keeping its owner and permissions: the temporary is
+/// Replaces an existing file keeping its owner and permissions.  The temporary is
 /// created with the target's mode, so an executable stays one.
 fn copy_metadata(
     source: &File,
@@ -313,13 +317,13 @@ fn copy_metadata(
     let owner = source.metadata().ok();
     let uid = owner.as_ref().map(MetadataExt::uid).unwrap_or(u32::MAX);
     let gid = owner.as_ref().map(MetadataExt::gid).unwrap_or(u32::MAX);
-    // Only root can hand ownership over; losing it is not worth losing the edit.
+    // Only root can hand ownership over.  Losing it is not worth losing the edit.
     unsafe { libc::fchown(temp.as_raw_fd(), uid as libc::uid_t, gid as libc::gid_t) };
 
     #[cfg(target_os = "macos")]
     {
-        // Carry the ACL and extended attributes, best effort: losing one is worth
-        // reporting, not worth losing the edit over.
+        // Carry the ACL and extended attributes, best effort.  Losing one is worth
+        // reporting, but not worth losing the edit over.
         unsafe {
             libc::fcopyfile(
                 source.as_raw_fd(),
@@ -341,12 +345,12 @@ fn copy_metadata(
 }
 
 /// Carries every extended attribute from one open file to another, skipping the ones
-/// this process has no business setting: bytes and mode are the contract.
+/// this process has no business setting.  The bytes and the mode are the contract.
 #[cfg(target_os = "linux")]
 fn copy_xattrs(from: std::os::fd::RawFd, to: std::os::fd::RawFd) {
     for name in xattr_names(from) {
         if let Some(value) = xattr_value(from, &name) {
-            // flags 0: create or replace, which is all a copy needs.
+            // flags 0 creates or replaces, which is all a copy needs.
             unsafe { libc::fsetxattr(to, name.as_ptr(), value.as_ptr().cast(), value.len(), 0) };
         }
     }
@@ -398,10 +402,10 @@ fn rename(temp: NamedTempFile, target: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// The last step for a file that was not there: `link`, not `rename`.  A link will not
-/// overwrite a name that appeared while the temporary was being written, so the first
-/// writer keeps its file and this one comes back with `File exists`; a rename would
-/// have quietly won a race nobody was watching.
+/// The last step for a file that was not there is a `link`, not a `rename`.  A link
+/// will not overwrite a name that appeared while the temporary was being written, so
+/// the first writer keeps its file and this one comes back with `File exists`.  A
+/// rename would have quietly won a race nobody was watching.
 ///
 /// Where linking is unsupported — a FAT card, one FUSE mount out of several — the link
 /// is retried as a rename, because the race protection was never available there.
@@ -412,7 +416,7 @@ fn link_new(temp: NamedTempFile, target: &Path) -> Result<(), String> {
         }
         return rename(temp, target);
     }
-    // Closing also unlinks the temporary's own name: the target keeps the inode.
+    // Closing also unlinks the temporary's own name, and the target keeps the inode.
     temp.close().map_err(|err| failed(target, &err))
 }
 
@@ -422,7 +426,7 @@ fn link_new(temp: NamedTempFile, target: &Path) -> Result<(), String> {
 const LINK_UNSUPPORTED: &[i32] = &[libc::EPERM, libc::ENOTSUP, libc::EOPNOTSUPP, libc::ENOSYS];
 
 fn link_was_unsupported(err: &io::Error) -> bool {
-    // `EEXIST` must stay an error: falling back on it would hand back the race this
+    // `EEXIST` must stay an error.  Falling back on it would hand back the race this
     // link exists to lose.  `EXDEV` is absent because the temporary is made next to
     // its target, so a rename could not cross the device either.
     err.raw_os_error()
@@ -478,7 +482,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
-    /// A file path in a self-deleting directory; the caller keeps the directory.
+    /// A file path in a self-deleting directory.  The caller keeps the directory.
     fn temp_path(tag: &str) -> (PathBuf, tempfile::TempDir) {
         let dir = tempfile::TempDir::with_prefix(format!("ds4-helper-{tag}-")).unwrap();
         (dir.path().join("file"), dir)
@@ -565,8 +569,8 @@ mod tests {
         replace(text, b"hello".to_vec(), None).await.unwrap();
         assert_eq!(std::fs::read(text).unwrap(), b"hello");
         let parent = path.parent().unwrap();
-        // Only this file's temporaries: other tests replace their own files here at the
-        // same moment.
+        // Only this file's temporaries.  Other tests replace their own files here at
+        // the same moment.
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
         let leftovers: Vec<_> = std::fs::read_dir(parent)
             .unwrap()
@@ -601,7 +605,7 @@ mod tests {
         std::fs::remove_file(text).unwrap();
     }
 
-    /// The wording is part of the interface: it tells the model to read again rather
+    /// The wording is part of the interface.  It tells the model to read again rather
     /// than repeat the edit.
     #[tokio::test]
     async fn a_lost_race_is_answered_in_the_agents_words() {
@@ -639,7 +643,7 @@ mod tests {
             "nothing happened to it"
         );
 
-        // Same name, same bytes, another inode: the part a byte compare cannot see.
+        // Same name, same bytes, another inode.  That is what a byte compare cannot see.
         let moved = dir.join("moved");
         std::fs::write(&moved, b"bytes\n").unwrap();
         std::fs::rename(&moved, &quiet).unwrap();
@@ -671,13 +675,13 @@ mod tests {
     }
 
     /// A file that appears while the temporary is being written keeps its own
-    /// contents: the last step of a new file is a link, and a link loses a race
+    /// contents.  The last step of a new file is a link, and a link loses a race
     /// instead of winning it.
     #[test]
     fn a_file_created_underneath_a_write_is_not_overwritten() {
         let (path, _dir) = temp_path("link");
         let text = path.to_str().unwrap();
-        // Not through `replace`: the temporary is held while another writer creates
+        // Not through `replace`.  The temporary is held while another writer creates
         // the name it was written for.
         let temp = create_new(&path, b"the helper wrote this\n").unwrap();
         std::fs::write(text, b"someone else got here first\n").unwrap();
@@ -697,7 +701,7 @@ mod tests {
     }
 
     /// Retrying a failed link is for a filesystem that cannot link, never for the race
-    /// the link was put there to lose: falling back on `EEXIST` would hand it straight
+    /// the link was put there to lose.  Falling back on `EEXIST` would hand it straight
     /// back.  A filesystem that links happily cannot show either half, so the decision
     /// itself is what is checked here.
     #[test]
@@ -758,8 +762,8 @@ mod tests {
         let link = dir.path().join("link");
         std::fs::write(&target, b"victim").unwrap();
         std::os::unix::fs::symlink(&target, &link).unwrap();
-        // The path is resolved first and then opened without following: a name that is
-        // a symlink reaches its target, a symlink swapped in afterwards is refused.
+        // The path is resolved first and then opened without following.  A name that is
+        // a symlink reaches its target, and a symlink swapped in afterwards is refused.
         replace(link.to_str().unwrap(), b"replacement".to_vec(), None)
             .await
             .unwrap();

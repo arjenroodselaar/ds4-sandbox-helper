@@ -1,4 +1,8 @@
-//! ds4-sandbox-helper: the sandbox side of `ds4-agent --sandbox`.
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+//! ds4-sandbox-helper is the sandbox side of `ds4-agent --sandbox`.
 //!
 //! Framed requests on stdin, framed answers on stdout, and nothing else on stdout.
 //! Diagnostics go to stderr.  The protocol is specified in ds4's docs/SANDBOX.md.
@@ -134,7 +138,7 @@ fn default_shell() -> PathBuf {
     pick_shell(Path::new(BASH_SHELL), Path::new(FALLBACK_SHELL))
 }
 
-/// A shell with no slash is left for PATH to resolve at exec time; a path is checked now.
+/// A shell with no slash is left for PATH to resolve at exec time.  A path is checked now.
 fn check_shell(shell: &Path) -> Result<(), String> {
     if shell.as_os_str().is_empty() {
         return Err("invalid shell: the name is empty".into());
@@ -226,7 +230,7 @@ mod tests {
     ///
     /// # Safety
     /// Mutating the environment is unsound while another thread reads it, which is
-    /// why the caller must hold `ENV`: every test in this module holds it too.
+    /// why the caller must hold `ENV`.  Every test in this module holds it too.
     unsafe fn without_env<T>(body: impl FnOnce() -> T) -> T {
         const VARS: [&str; 3] = [READ_VAR, UPTO_VAR, SHELL_VAR];
         let saved = VARS.map(std::env::var_os);
@@ -336,7 +340,7 @@ mod tests {
         }
     }
 
-    /// Only the failures are tried: succeeding would move this test process's working
+    /// Only the failures are tried.  Succeeding would move this test process's working
     /// directory out from under the other tests.  The end-to-end test covers success.
     #[test]
     fn a_directory_that_cannot_be_worked_in_is_named_before_anything_runs() {
@@ -430,7 +434,7 @@ mod tests {
             format!("{} is not a file", scratch.path().display())
         );
 
-        // A bare name is accepted whatever is on PATH: exec is the one that answers.
+        // A bare name is accepted whatever is on PATH, because exec is the one that answers.
         assert!(check_shell(Path::new("no-such-shell-anywhere")).is_ok());
     }
 

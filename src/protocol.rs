@@ -1,7 +1,11 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! The two message shapes carried inside frames, and the strictness that goes
 //! with them.
 //!
-//! A frame is read for its `id` and its text; everything else is ignored so either
+//! A frame is read for its `id` and its text.  Everything else is ignored so either
 //! side can grow.  A frame with no numeric `id`, or a response with no boolean `ok`,
 //! ends the session rather than being guessed at.
 
@@ -23,9 +27,9 @@ pub struct Request {
     pub limits: Limits,
 }
 
-/// The `limits` object of a request: what the sender says about the model, kept apart
-/// from `args` because it is not model input and is not all strings.  A member this
-/// version does not know is ignored rather than rejected.
+/// The `limits` object of a request, which is what the sender says about the model.
+/// It is kept apart from `args` because it is not model input and is not all strings.
+/// A member this version does not know is ignored rather than rejected.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Limits {
     /// Lines a `read` or `more` with no size should return.
@@ -44,7 +48,8 @@ impl Limits {
 }
 
 impl Request {
-    /// The value of `key`, or `None` when it was omitted: `""` was written by the model.
+    /// The value of `key`, or `None` when it was omitted.  An empty `""` was written
+    /// by the model.
     pub fn arg(&self, key: &str) -> Option<&str> {
         self.args.get(key).map(String::as_str)
     }
@@ -58,7 +63,7 @@ impl Request {
         }
     }
 
-    /// The size for a bare `read` or `more`: the sender's number wins, capped at
+    /// The size for a bare `read` or `more`.  The sender's number wins, capped at
     /// `MAX_INJECTED_READ_LINES`, and `fallback` covers a sender that says nothing.
     pub fn read_lines_or(&self, fallback: i64) -> i64 {
         match self.limits.read_lines {
@@ -77,7 +82,7 @@ impl Request {
     }
 }
 
-/// A framing violation that ends the session: the peer is not answering requests.
+/// A framing violation that ends the session.  The peer is not answering requests.
 #[derive(Debug)]
 pub enum ProtocolError {
     NotAnObject,
@@ -156,7 +161,7 @@ pub fn response_error(id: i64, error: &str) -> Vec<u8> {
         .into_bytes()
 }
 
-/// A notice: diagnostics for `<trace>.sandbox.log`.  `id` 0 is never a request.
+/// A notice, which the agent writes to `<trace>.sandbox.log`.  `id` 0 is never a request.
 pub fn notice(text: &str) -> Vec<u8> {
     json!({ "id": 0, "type": "log", "text": text })
         .to_string()
@@ -222,7 +227,7 @@ mod tests {
 
     #[test]
     fn a_duplicate_argument_still_yields_one_value() {
-        // Which of a repeated key wins is not specified; that a tool sees one does.
+        // Which of a repeated key wins is not specified.  That a tool sees one does.
         let req =
             parse_request(br#"{"id":1,"tool":"x","args":{"k":"first","k":"second"}}"#).unwrap();
         assert!(matches!(req.arg("k"), Some("first") | Some("second")));

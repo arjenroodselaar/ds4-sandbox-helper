@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Tool dispatch for the sandbox side.
 //!
 //! The agent routes nothing here that it does not list, and nothing here reaches
@@ -27,7 +31,7 @@ pub const SANDBOX_TOOLS: [&str; 9] = [
     "bash_stop",
 ];
 
-/// Default shell: models write their commands for bash, so `[[ ]]` and arrays work.
+/// The default shell.  Models write their commands for bash, so `[[ ]]` and arrays work.
 pub const BASH_SHELL: &str = "/bin/bash";
 
 pub const FALLBACK_SHELL: &str = "/bin/sh";

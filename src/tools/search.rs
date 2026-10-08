@@ -1,9 +1,13 @@
-//! `search`: walk a tree and report matching lines.
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+//! `search` walks a tree and reports matching lines.
 //!
 //! Results stream into a byte budget and the walk stops when it is full, because a
 //! repository-wide search has no natural end.  Anything unreadable is counted and
-//! reported in a tail note: an incomplete answer read as a complete one is worse than
-//! no answer.
+//! reported in a tail note.  An incomplete answer read as a complete one is worse
+//! than no answer.
 
 use std::fmt::Write;
 use std::path::Path;
@@ -95,7 +99,7 @@ pub async fn search(request: &Request) -> Result<String, String> {
     let case_sensitive = request.bool_or("case_sensitive", true);
     let matcher = if mode == "regex" {
         // Documented as POSIX extended regex, which this syntax is a superset of for
-        // what a model writes; what differs (backreferences) fails to compile.
+        // what a model writes.  What differs (backreferences) fails to compile.
         match RegexBuilder::new(query)
             .case_insensitive(!case_sensitive)
             .build()
@@ -151,7 +155,7 @@ pub async fn search(request: &Request) -> Result<String, String> {
 }
 
 /// Recurses through a file or directory.  The root is followed (`stat`), nested
-/// symlinks are not (`lstat`): a tree that contains a link to `/` should still be one
+/// symlinks are not (`lstat`).  A tree that contains a link to `/` should still be one
 /// search, not an exit.
 fn walk<'a>(ctx: &'a mut Ctx<'_>, path: &'a str, depth: usize) -> BoxFuture<'a, ()> {
     Box::pin(async move {
@@ -294,7 +298,7 @@ async fn search_file(ctx: &mut Ctx<'_>, path: &str) {
     }
 }
 
-/// `  N line`: indented so a result block is visually inside the file it names.
+/// `  N line` is indented, so a result block sits visually inside the file it names.
 fn emit_line(ctx: &mut Ctx, ring: &[Option<String>], number: usize) {
     let text = ring[number % RING].clone().unwrap_or_default();
     let _ = writeln!(ctx.out, "  {number} {text}");
@@ -303,7 +307,7 @@ fn emit_line(ctx: &mut Ctx, ring: &[Option<String>], number: usize) {
 enum ReadLine {
     Line(String),
     Eof,
-    /// A NUL, or a line long enough to fill the answer by itself: not text to read.
+    /// A NUL, or a line long enough to fill the answer by itself.  That is not text.
     Binary,
     Io(String),
 }
@@ -311,7 +315,7 @@ enum ReadLine {
 async fn read_line(reader: &mut tokio::io::BufReader<tokio::fs::File>) -> ReadLine {
     let mut bytes: Vec<u8> = Vec::new();
     loop {
-        // Bytes come from the buffer, not the file: the NUL or the 128 KiB mark can
+        // Bytes come from the buffer, not the file.  The NUL or the 128 KiB mark can
         // fall between two reads.
         let byte = match reader.fill_buf().await {
             Ok(buf) => match buf.first() {
@@ -390,7 +394,7 @@ fn glob_match(pattern: &str, text: &str) -> bool {
                 _ => {}
             }
         }
-        // Mismatch: give the last `*` one more character to cover.
+        // Mismatch.  Give the last `*` one more character to cover.
         if let Some(at) = star {
             star_t += 1;
             t = star_t;
@@ -448,7 +452,7 @@ mod tests {
     use super::*;
     use crate::protocol::parse_request;
 
-    /// A small source tree in a self-deleting directory; the caller keeps the directory.
+    /// A small source tree in a self-deleting directory.  The caller keeps it.
     fn tree() -> (PathBuf, tempfile::TempDir) {
         let temp = tempfile::TempDir::with_prefix("ds4-helper-search-").unwrap();
         let root = temp.path().to_path_buf();

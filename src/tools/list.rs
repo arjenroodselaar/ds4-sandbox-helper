@@ -1,6 +1,10 @@
-//! `list`: one directory, in the order the filesystem gives it.
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+//! `list` prints one directory, in the order the filesystem gives it.
 //!
-//! Not sorted: the agent prints `readdir()` order, and the model reads that order.
+//! Not sorted.  The agent prints `readdir()` order, and the model reads that order.
 
 use std::fmt::Write;
 

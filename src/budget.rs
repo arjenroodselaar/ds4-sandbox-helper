@@ -1,8 +1,11 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! The byte budget every tool output shares.
 //!
 //! An over-long answer pushes the conversation out of the model's window, so the
-//! sandbox keeps the agent's rule: stop at 128 KiB on a character boundary and say
-//! so.
+//! sandbox stops at 128 KiB on a character boundary and says so.
 
 use std::fmt;
 use std::fmt::Write;
@@ -40,7 +43,7 @@ impl Budget {
         self.truncated
     }
 
-    /// The text so far, without the note: `read` adds its own with resume coordinates.
+    /// The text so far, without the note.  `read` adds its own, with resume coordinates.
     pub fn text(&self) -> &str {
         &self.text
     }
@@ -104,7 +107,7 @@ mod tests {
         let mut b = Budget::new(5);
         write!(b, "a😀bc").unwrap();
         let text = b.into_string();
-        // "a" + the 4-byte emoji fit exactly; "bc" does not.
+        // "a" + the 4-byte emoji fit exactly.  "bc" does not.
         assert!(text.starts_with("a😀"), "{}", text.escape_debug());
         assert!(!text[NOTE.len()..].contains('b'));
         assert!(std::str::from_utf8(text.as_bytes()).is_ok());

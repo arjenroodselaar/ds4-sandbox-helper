@@ -1,11 +1,15 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! `read` and `more`, ported from `agent_read_range_from()`.
 //!
-//! The interesting part is the pair of numbers in the truncation note: they let the
+//! The interesting part is the pair of numbers in the truncation note.  They let the
 //! model ask for exactly the next chunk, and let `more` resume from a byte offset
 //! instead of re-reading what was discarded.  A resumed chunk can start mid-line, and
 //! "(continued)" says so.
 //!
-//! Bytes are streamed, not slurped: a sandbox that buffered a 2 GB log to find line
+//! Bytes are streamed, not slurped.  A sandbox that buffered a 2 GB log to find line
 //! 120 would be the first thing the outer sandbox killed.
 
 use std::fmt::Write as _;
@@ -18,7 +22,7 @@ use crate::budget::MAX_TOOL_BYTES;
 use crate::budget::NOTE_MARGIN;
 use crate::files;
 
-/// Room the body may use; the header and the resume note are written afterwards.
+/// Room the body may use.  The header and the resume note are written afterwards.
 const BODY_LIMIT: usize = MAX_TOOL_BYTES - NOTE_MARGIN;
 
 /// Where the next `more` resumes.
@@ -32,8 +36,8 @@ pub struct MoreState {
 }
 
 /// A byte cursor with look-ahead and a running position, which is what the resume
-/// offset is measured in.  The look-ahead is the buffered reader's own buffer:
-/// peek at the next byte, then take it or not.
+/// offset is measured in.  The look-ahead is the buffered reader's own buffer.  Peek
+/// at the next byte, then take it or not.
 struct Cursor {
     source: tokio::io::BufReader<tokio::fs::File>,
     pos: usize,
@@ -175,7 +179,7 @@ async fn read_inner(
                 cur.byte().await.map_err(io_failure)?;
             }
             if !bare || crlf {
-                // One line ending for the model; bare mode keeps the bytes it was given.
+                // One line ending for the model.  Bare mode keeps the bytes it was given.
                 body.push(b'\n');
             }
             line += 1;
@@ -267,7 +271,7 @@ fn io_failure(err: std::io::Error) -> String {
 mod tests {
     use super::*;
 
-    /// A file holding `bytes` in a self-deleting directory; the caller keeps the directory.
+    /// A file holding `bytes` in a self-deleting directory.  The caller keeps it.
     fn write_file(tag: &str, bytes: &[u8]) -> (std::path::PathBuf, tempfile::TempDir) {
         let dir = tempfile::TempDir::with_prefix(format!("ds4-helper-read-{tag}-")).unwrap();
         let path = dir.path().join("file");
