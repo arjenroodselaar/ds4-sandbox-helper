@@ -29,15 +29,16 @@ ds4-agent --sandbox 'docker run -i --rm -v "$PWD:/w" -w /w helper' …
 The first frame is the helper's own, written before a byte of a request is read:
 
 ```
-132
-{"id":0,"text":"ds4-sandbox-helper 0.1.0 ready: dir /home/ds4-sandbox-helper, read_lines default 120, upto marker off","type":"log"}
+149
+{"id":0,"text":"ds4-sandbox-helper 0.1.0 ready: dir /home/ds4-sandbox-helper, shell /bin/bash, read_lines default 120, upto marker off","type":"log"}
 ```
 
 The word `ready` is what the agent blocks on, and it blocks before loading a
 model. The wait ends when that word arrives, when the process dies, or when it
-sends something that is not a frame. Everything else in the line is for the user:
-the agent prints it as `sandbox: …` beside its own model-loading messages, so a
-run says which sandbox is answering, in which directory, with which settings.
+sends something that is not a frame. Everything else in the line is for the user
+and the agent prints it as `sandbox: …` beside its own log messages. So the log
+reports which sandbox is answering, in which directory, with which shell and
+which settings.
 
 Until that notice arrives the agent also echoes the helper's stderr a line at a
 time with the same `sandbox: ` prefix, which is how a bad option or a directory
@@ -49,11 +50,12 @@ agent waiting for as long as the process lives.
 
 ## Options
 
-| Option | Env | Default |
-| --- | --- | --- |
-| `--read-lines N` | `DS4_READ_LINES` | `120` |
-| `--edit-upto` | `DS4_EDIT_UPTO` | off |
-| `--chdir DIR` | — | the launch directory |
+| Option           | Env              | Default                     |
+| ---------------- | ---------------- | --------------------------- |
+| `--read-lines N` | `DS4_READ_LINES` | `120`                       |
+| `--edit-upto`    | `DS4_EDIT_UPTO`  | off                         |
+| `--shell SHELL`  | `DS4_SHELL`      | `/bin/bash`, else `/bin/sh` |
+| `--chdir DIR`    | —                | the launch directory        |
 
 `--read-lines N` is the fallback for how many lines a bare `read` or `more`
 returns. The agent sends the real number with every request
@@ -65,6 +67,17 @@ a person at a terminal.
 everything between two anchors. It can delete a great deal at once, so it is
 opt-in.
 
+`--shell SHELL` is the shell used to execute a command, as
+`<shell> -c <command>`. When not explicitly provided the helper uses `/bin/bash`
+if available in the sandbox, so arrays, `[[ ]]` and process substitution mean
+what the model meant. If not available the helper falls back to `/bin/sh` which
+is assumed to be available in the sandbox. The sandbox startup notice reports
+which shell has been selected. An absolute path is checked before the first
+frame with errors reported on stderr and status 1 . A path without a slash is
+left for `PATH` to resolve when the command runs; checking it here would mean
+answering the same question twice, and a wrong answer refuses a shell that
+works.
+
 `--chdir DIR` works in `DIR` instead: every relative path in a request, and the
 directory `bash` starts a command in, resolve there. It happens before the first
 frame is read, so nothing is ever answered from somewhere else. The same flag
@@ -73,13 +86,15 @@ directory inherited through one would be entered twice over for a helper the
 agent had already moved, and a relative one would then mean somewhere else
 entirely.
 
-The first two also read the matching environment variable, which is easier than
-quoting them through a container's `-e`.  `--help` lists all three with their
+The first three also read the matching environment variable, which is easier
+than quoting them through a container's `-e`. `--help` lists all four with their
 defaults, and a value that does not parse — on the command line or in the
 environment — stops the helper with usage on stderr rather than being quietly
-ignored.  A `--chdir` that cannot be done is a different kind of mistake, and
-gets the agent's own words for it: `invalid working directory …` or `… is not a
-directory`, on stderr, with status 1 and nothing on stdout.
+ignored. A `--chdir` that cannot be done and a `--shell` that cannot be run are
+a different kind of mistake, and get the agent's own words for it:
+`invalid working directory …`, `… is not a directory`, `invalid shell …`,
+`… is not a file`, `… is not executable`, on stderr, with status 1 and nothing
+on stdout.
 
 ## Tools
 
@@ -98,9 +113,9 @@ long. A job finished by a signal reports `exit_status` as 128+signal, so a
 stopped job reads as 143 or 137.
 
 A request carries with it the caps the helper cannot work out for itself, in a
-`limits` object of its own.  The one today is `limits.read_lines`, the size a
+`limits` object of its own. The one today is `limits.read_lines`, the size a
 bare `read` or `more` should return: it follows the model's context window, and
-is capped at 500 here whatever the sender asks for.  A limit this version does
+is capped at 500 here whatever the sender asks for. A limit this version does
 not know is ignored rather than rejected, which is the point of keeping them in
 an object of their own: another cap can be named later without changing the
 shape of a request. `--read-lines` is what a bare read means when the sender
@@ -114,11 +129,10 @@ its way out of it, which is the one thing the design has to avoid.
 ## Layout
 
 - `src/wire.rs` — The frame: a decimal byte count, a newline, that many bytes.
-- `src/protocol.rs` — Request and response shapes, notices, argument
-  extraction.
+- `src/protocol.rs` — Request and response shapes, notices, argument extraction.
 - `src/budget.rs` — The 128 KiB output ceiling every answer is cut to.
-- `src/files.rs` — Reading, and replacing a file without following a symlink
-  or losing its mode.
+- `src/files.rs` — Reading, and replacing a file without following a symlink or
+  losing its mode.
 - `src/tools/` — One module per tool, plus the dispatch.
 - `src/server.rs` — The read–dispatch–answer loop.
 - `tests/e2e.rs` — The real binary over real pipes, real files and real
@@ -171,13 +185,13 @@ surprise:
 ## Platforms
 
 macOS and Linux are both supported, and they differ in one place worth naming:
-the metadata that comes across when a file is replaced.  macOS has a call that
+the metadata that comes across when a file is replaced. macOS has a call that
 copies the rest of a file in one go, and it is used for the ACL and the extended
 attributes. Linux has no such call, but it keeps the POSIX ACL as an attribute
 of its own (`system.posix_acl_access`), so carrying the attributes across
-carries the ACL with them.  Both are best effort: a label this process may not
+carries the ACL with them. Both are best effort: a label this process may not
 write — an SELinux context, a `trusted.*` attribute — is skipped, and the write
-still succeeds.  A filesystem that will not hold attributes at all is not a
+still succeeds. A filesystem that will not hold attributes at all is not a
 failure of the write either, and the test that checks this quietly does nothing
 there.
 

@@ -40,14 +40,16 @@ pub enum Outcome {
 }
 
 /// What the startup notice names besides the version: the directory every relative
-/// path resolves in, the read size that applies to a sender stating no limit, and
-/// whether `edit` accepts an `[upto]` marker.  The directory is left out rather
-/// than losing the hello if the process cannot say where it is.
+/// path resolves in, the shell used to execute a command, the read size that applies
+/// to a sender stating no limit, and whether `edit` accepts an `[upto]` marker.  The
+/// directory is left out rather than losing the hello if the process cannot say where
+/// it is.
 fn startup_details(config: &Config) -> String {
     let mut details = Vec::new();
     if let Ok(dir) = current_dir() {
         details.push(format!("dir {}", dir.display()));
     }
+    details.push(format!("shell {}", config.shell.display()));
     details.push(format!("read_lines default {}", config.read_lines));
     details.push(format!(
         "upto marker {}",

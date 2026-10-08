@@ -5,6 +5,8 @@
 //! and nothing here reaches outside the box it was started in except by the paths the
 //! model names.
 
+use std::path::PathBuf;
+
 use crate::protocol::Request;
 
 pub mod bash;
@@ -29,6 +31,14 @@ pub const SANDBOX_TOOLS: [&str; 9] = [
     "bash_stop",
 ];
 
+/// The shell used to execute a command when none is explicitly given and this sandbox
+/// has Bash.  Models write their commands for Bash, so arrays, `[[ ]]` and process
+/// substitution are expected to work.
+pub const BASH_SHELL: &str = "/bin/bash";
+
+/// The shell used to execute a command when Bash is not present in the sandbox.
+pub const FALLBACK_SHELL: &str = "/bin/sh";
+
 /// Settings a request does not carry.
 ///
 /// `read_lines` is the fallback for the size a bare `read` or `more` returns.  The
@@ -39,13 +49,17 @@ pub const SANDBOX_TOOLS: [&str; 9] = [
 pub struct Config {
     pub read_lines: i64,
     pub edit_upto: bool,
+    /// The shell used to execute a command, settled on when the helper started.
+    pub shell: PathBuf,
 }
 
+/// The default settings of for a sandbox a helper.
 impl Default for Config {
     fn default() -> Self {
         Config {
             read_lines: 120,
             edit_upto: false,
+            shell: PathBuf::from(FALLBACK_SHELL),
         }
     }
 }
@@ -110,7 +124,7 @@ pub async fn run(
         "edit" => edit::edit(request, config.edit_upto).await,
         "list" => list::list(request).await,
         "search" => search::search(request).await,
-        "bash" => bash::start(request, &mut session.jobs).await,
+        "bash" => bash::start(request, &mut session.jobs, &config.shell).await,
         "bash_status" => bash::status_tool(request, &mut session.jobs).await,
         "bash_stop" => bash::stop(request, &mut session.jobs).await,
         // The agent answers an unknown name itself and never asks, so reaching this

@@ -16,13 +16,16 @@ mod server;
 mod tools;
 mod wire;
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::ArgAction;
 use clap::Parser;
+use tools::BASH_SHELL;
 use tools::Config;
+use tools::FALLBACK_SHELL;
 
 // The command line, which is also what --help prints.  The doc comment on the struct
 // would become help text, and these two fields are not the sort of thing to tell a
@@ -72,6 +75,14 @@ struct Args {
     )]
     edit_upto: bool,
 
+    /// The shell used to execute a command
+    ///
+    /// Commands requested by the agent are executed as  `<shell> -c <command>`. When
+    /// not explicitly provided the helper uses `/bin/bash` or falls back to `/bin/sh`
+    /// if not available.
+    #[arg(long, value_name = "SHELL", env = "DS4_SHELL")]
+    shell: Option<PathBuf>,
+
     /// Work in DIR instead of the directory this was started in
     ///
     /// The agent's own --chdir, for whoever starts this helper directly: every
@@ -79,7 +90,7 @@ struct Args {
     /// resolved there.  It happens before the first frame is read, so there is no
     /// moment when the answer to a relative path could come from somewhere else.
     ///
-    /// There is no environment variable for it, unlike the two above.  A directory
+    /// There is no environment variable for it, unlike the options above.  A directory
     /// inherited through the environment would be entered twice over for a helper the
     /// agent had already moved, and a relative one would then mean somewhere else
     /// entirely.
@@ -92,6 +103,7 @@ impl Args {
         Config {
             read_lines: self.read_lines,
             edit_upto: self.edit_upto,
+            shell: self.shell.clone().unwrap_or_else(default_shell),
         }
     }
 }
@@ -137,6 +149,51 @@ fn enter(dir: &Path) -> Result<(), String> {
     }
 }
 
+/// Whether `path` names something this process could exec: a file with an execute
+/// bit, followed through a symlink because that is what exec does with one.
+fn can_run(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+}
+
+/// The shell used to execute a command, using the `preferred` where this sandbox can
+/// run it, and `fallback` where it cannot. This function only uses a `stat` rather than
+/// a test run to determine if the given paths are valid.
+fn pick_shell(preferred: &Path, fallback: &Path) -> PathBuf {
+    if can_run(preferred) {
+        preferred.to_path_buf()
+    } else {
+        fallback.to_path_buf()
+    }
+}
+
+/// Select the from the default shell options based on availablity in the sandbox.
+fn default_shell() -> PathBuf {
+    pick_shell(Path::new(BASH_SHELL), Path::new(FALLBACK_SHELL))
+}
+
+/// Check whether or not the shell at the given path can run.
+fn check_shell(shell: &Path) -> Result<(), String> {
+    if shell.as_os_str().is_empty() {
+        return Err("invalid shell: the name is empty".into());
+    }
+    if !shell.to_string_lossy().contains('/') {
+        return Ok(());
+    }
+    match std::fs::metadata(shell) {
+        Err(err) => Err(format!(
+            "invalid shell {}: {}",
+            shell.display(),
+            files::err_message(&err)
+        )),
+        Ok(meta) if !meta.is_file() => Err(format!("{} is not a file", shell.display())),
+        Ok(meta) if meta.permissions().mode() & 0o111 == 0 => {
+            Err(format!("{} is not executable", shell.display()))
+        }
+        Ok(_) => Ok(()),
+    }
+}
+
 fn main() -> ExitCode {
     // Help and version print and exit successfully; an argument that cannot be read
     // prints a usage line and exits 2, which is the status the help text promises.
@@ -148,6 +205,10 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
     let config = args.config();
+    if let Err(message) = check_shell(&config.shell) {
+        eprintln!("ds4-sandbox-helper: {message}");
+        return ExitCode::FAILURE;
+    }
 
     // enable_all: the tools wait on pipes, on child processes, and on timers, and a
     // runtime that has not enabled an driver refuses to wait on any of them.
@@ -191,6 +252,7 @@ mod tests {
 
     const READ_VAR: &str = "DS4_READ_LINES";
     const UPTO_VAR: &str = "DS4_EDIT_UPTO";
+    const SHELL_VAR: &str = "DS4_SHELL";
 
     /// `list` is the command line after the program name.
     ///
@@ -204,19 +266,20 @@ mod tests {
         args_from(list, env).map(|args| args.config())
     }
 
-    /// Runs `body` with neither variable set, and puts back what was there.  What the
-    /// defaults are is only observable when the developer exporting them is not.
+    /// Runs `body` with none of the variables set, and puts back what was there.  What
+    /// the defaults are is only observable when the developer exporting them is not.
     ///
     /// # Safety
     /// Mutating the environment is unsound while another thread reads it, which is
     /// why the caller must hold `ENV`: every test in this module holds it too.
     unsafe fn without_env<T>(body: impl FnOnce() -> T) -> T {
-        let saved = [READ_VAR, UPTO_VAR].map(std::env::var_os);
-        for name in [READ_VAR, UPTO_VAR] {
+        const VARS: [&str; 3] = [READ_VAR, UPTO_VAR, SHELL_VAR];
+        let saved = VARS.map(std::env::var_os);
+        for name in VARS {
             unsafe { std::env::remove_var(name) };
         }
         let out = body();
-        for (name, value) in [READ_VAR, UPTO_VAR].into_iter().zip(saved) {
+        for (name, value) in VARS.into_iter().zip(saved) {
             match value {
                 Some(value) => unsafe { std::env::set_var(name, value) },
                 None => unsafe { std::env::remove_var(name) },
@@ -231,6 +294,15 @@ mod tests {
         let args = unsafe { without_env(|| args_from(&[], &env)) }.unwrap();
         assert_eq!(args.read_lines, 120);
         assert!(!args.edit_upto);
+
+        assert_eq!(args.shell, None);
+        let shell = args.config().shell;
+        assert!(can_run(&shell), "{shell:?} cannot be run");
+        assert!(
+            shell == Path::new(BASH_SHELL) || shell == Path::new(FALLBACK_SHELL),
+            "{shell:?} is neither of the two shells this knows about"
+        );
+
         // No directory asked for means the one the process was started in, which is
         // the only answer that does not need this program to have an opinion.
         assert_eq!(args.chdir, None);
@@ -277,10 +349,12 @@ mod tests {
         unsafe {
             std::env::set_var(READ_VAR, "240");
             std::env::set_var(UPTO_VAR, "yes");
+            std::env::set_var(SHELL_VAR, "/bin/bash");
         }
         let config = config_from(&[], &env).unwrap();
         assert_eq!(config.read_lines, 240);
         assert!(config.edit_upto);
+        assert_eq!(config.shell, PathBuf::from("/bin/bash"));
         // A command line outranks the environment, which is what makes the variable
         // a default rather than an override.
         assert_eq!(
@@ -289,9 +363,14 @@ mod tests {
                 .read_lines,
             60
         );
+        assert_eq!(
+            config_from(&["--shell", "/bin/zsh"], &env).unwrap().shell,
+            PathBuf::from("/bin/zsh")
+        );
         unsafe {
             std::env::remove_var(READ_VAR);
             std::env::remove_var(UPTO_VAR);
+            std::env::remove_var(SHELL_VAR);
         }
     }
 
@@ -341,6 +420,87 @@ mod tests {
     }
 
     #[test]
+    fn a_shell_can_be_asked_for_in_either_spelling() {
+        let env = ENV.lock().unwrap();
+        for spelling in [&["--shell", "/bin/zsh"][..], &["--shell=/bin/zsh"][..]] {
+            assert_eq!(
+                config_from(spelling, &env).unwrap().shell,
+                PathBuf::from("/bin/zsh"),
+                "{spelling:?}"
+            );
+        }
+        // A name without a slash is carried through as it was written: PATH is what
+        // resolves it, at the moment the command is spawned.
+        assert_eq!(
+            config_from(&["--shell", "zsh"], &env).unwrap().shell,
+            PathBuf::from("zsh")
+        );
+        // A flag that names no shell is a mistake in the command line, not a request
+        // for the shell a run with no option would have settled on.
+        assert!(config_from(&["--shell"], &env).is_err());
+    }
+
+    /// Test the process of resolving the default shell.
+    #[test]
+    fn the_shell_nobody_named_is_bash_where_bash_can_run() {
+        let scratch = tempfile::TempDir::with_prefix("ds4-helper-pick-").unwrap();
+        let bash = scratch.path().join("bash");
+        let fallback = scratch.path().join("sh");
+        std::fs::write(&bash, "#!/bin/sh\n").unwrap();
+        std::fs::write(&fallback, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&fallback, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // There is a file called bash here and it is not something to run.
+        assert_eq!(pick_shell(&bash, &fallback), fallback);
+
+        std::fs::set_permissions(&bash, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(pick_shell(&bash, &fallback), bash);
+
+        // A directory has execute bits of its own and is not a shell.
+        assert_eq!(pick_shell(scratch.path(), &fallback), fallback);
+
+        // The real look, in whichever direction this sandbox answers it.
+        let chosen = default_shell();
+        assert_eq!(
+            chosen == Path::new(BASH_SHELL),
+            can_run(Path::new(BASH_SHELL))
+        );
+    }
+
+    /// The complaints `check_shell` makes, in its words: whoever reads one has to be
+    /// able to tell "not there" from "not a file" and from "not executable".
+    #[test]
+    fn a_shell_that_cannot_run_is_named_before_anything_runs() {
+        let scratch = tempfile::TempDir::with_prefix("ds4-helper-shell-").unwrap();
+
+        let missing = scratch.path().join("missing");
+        let err = check_shell(&missing).unwrap_err();
+        assert!(
+            err.starts_with(&format!("invalid shell {}: ", missing.display())),
+            "{err}"
+        );
+        assert!(err.contains("No such file"), "{err}");
+
+        let file = scratch.path().join("a-file");
+        std::fs::write(&file, b"#!/bin/sh\n").unwrap();
+        assert_eq!(
+            check_shell(&file).unwrap_err(),
+            format!("{} is not executable", file.display())
+        );
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(check_shell(&file).is_ok());
+
+        assert_eq!(
+            check_shell(scratch.path()).unwrap_err(),
+            format!("{} is not a file", scratch.path().display())
+        );
+
+        // A bare name is accepted whatever is on PATH, because the answer here would
+        // be a second, differently obtained answer to the exec call's question.
+        assert!(check_shell(Path::new("no-such-shell-anywhere")).is_ok());
+    }
+
+    #[test]
     fn help_and_version_are_not_session_starts() {
         let _env = ENV.lock().unwrap();
         // Both are the parse failing with a request to print something, which is how
@@ -359,7 +519,14 @@ mod tests {
     fn the_help_names_the_options_and_the_served_tools() {
         let _env = ENV.lock().unwrap();
         let help = Args::command().render_help().to_string();
-        for expected in ["--read-lines", "--edit-upto", "--chdir", "DS4_EDIT_UPTO"] {
+        for expected in [
+            "--read-lines",
+            "--edit-upto",
+            "--shell",
+            "--chdir",
+            "DS4_EDIT_UPTO",
+            "DS4_SHELL",
+        ] {
             assert!(help.contains(expected), "help does not mention {expected}");
         }
         // The after-help is where the tool list lives, and it is built from the

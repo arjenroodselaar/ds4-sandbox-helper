@@ -10,6 +10,8 @@
 //! The codec here is written again on purpose: an integration test that imported the
 //! binary's own encoder could not catch an encoder that disagrees with the spec.
 
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::process::Stdio;
 
 use tokio::io::AsyncReadExt;
@@ -68,6 +70,9 @@ impl Helper {
     async fn start(args: &[&str]) -> Helper {
         let mut child = Command::new(env!("CARGO_BIN_EXE_ds4-sandbox-helper"))
             .args(args)
+            // Which shell a run with no option executes with is a question about the
+            // sandbox, not about whoever happens to have DS4_SHELL exported.
+            .env_remove("DS4_SHELL")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             // Diagnostics stay on the inherited stderr: the agent's contract is that
@@ -100,6 +105,12 @@ impl Helper {
         assert!(
             hello.to_ascii_lowercase().contains("ready"),
             "the startup notice has to contain the word ready: {hello}"
+        );
+        // The notice is also where a run says which shell it executes with, which is
+        // the one thing about a sandbox that a request cannot find out for itself.
+        assert!(
+            hello.contains("shell "),
+            "the notice names no shell: {hello}"
         );
         helper
     }
@@ -561,6 +572,83 @@ async fn a_shell_cannot_read_the_request_stream() {
     let listing = helper.ok("list", serde_json::json!({"path": "."})).await;
     assert!(listing.starts_with(".:\n"), "{listing}");
     helper.finish().await;
+}
+
+/// Which shell is used to execute a command is settled when the helper starts, and
+/// `$0` is the cheapest way to ask a shell which shell it is: it is the name the shell
+/// was started with.  Bash is the answer wherever the sandbox has it, because that is
+/// the shell a model writes its commands for.
+#[tokio::test]
+async fn a_command_is_executed_with_bash_when_nothing_is_chosen() {
+    let expected = if Path::new("/bin/bash").exists() {
+        "/bin/bash"
+    } else {
+        "/bin/sh"
+    };
+    let mut helper = Helper::start(&[]).await;
+    let answer = helper
+        .ok("bash", serde_json::json!({"command": "echo $0"}))
+        .await;
+    assert!(
+        answer.contains(&format!("<output>\n{expected}\n</output>")),
+        "{answer}"
+    );
+    helper.finish().await;
+}
+
+#[tokio::test]
+async fn a_shell_named_without_a_slash_is_resolved_by_the_exec_call() {
+    let mut helper = Helper::start(&["--shell", "sh"]).await;
+    let answer = helper
+        .ok("bash", serde_json::json!({"command": "echo $0"}))
+        .await;
+    // The name that was asked for rather than the file PATH found, because that is
+    // what exec hands over, and it is the proof the shell came from the option.
+    assert!(answer.contains("<output>\nsh\n</output>"), "{answer}");
+    helper.finish().await;
+}
+
+/// A script that is not a shell at all is the clearest proof of the choice: it answers
+/// with what it was handed, and nothing but the shell named at startup could have
+/// handed it over that way.
+#[tokio::test]
+async fn the_shell_named_at_startup_is_the_one_used_to_execute_a_command() {
+    let (dir, _dir) = scratch("shell");
+    let fake = dir.join("fake-shell");
+    std::fs::write(&fake, "#!/bin/sh\necho \"chosen shell got: $2\"\n").unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut helper = Helper::start(&["--shell", fake.to_str().unwrap()]).await;
+    let answer = helper
+        .ok("bash", serde_json::json!({"command": "echo hi"}))
+        .await;
+    // `$1` is the `-c` the helper adds and `$2` the command after it, so the shell is
+    // addressed the way every shell is, and the model sees neither.
+    assert!(answer.contains("chosen shell got: echo hi"), "{answer}");
+    helper.finish().await;
+}
+
+#[tokio::test]
+async fn a_shell_that_cannot_be_run_stops_before_the_first_frame() {
+    let child = Command::new(env!("CARGO_BIN_EXE_ds4-sandbox-helper"))
+        .args(["--shell", "/definitely/not/here"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start the helper");
+    let output = child.wait_with_output().await.expect("wait");
+    assert_eq!(output.status.code(), Some(1), "{:?}", output.status);
+    assert!(
+        output.stdout.is_empty(),
+        "a refused --shell printed frames: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let text = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        text.contains("invalid shell /definitely/not/here"),
+        "{text}"
+    );
 }
 
 #[tokio::test]

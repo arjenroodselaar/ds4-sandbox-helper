@@ -128,8 +128,11 @@ impl Jobs {
 }
 
 /// Starts a command and reports the first snapshot, waiting at most `refresh_sec`
-/// for a command that finishes quickly.
-pub async fn start(request: &Request, jobs: &mut Jobs) -> Result<String, String> {
+/// for a command that finishes quickly.  The shell used to execute it is the one
+/// settled on when the helper started, not something the request can ask for: whoever
+/// started the helper knows what the sandbox has installed, and a model that could
+/// name an interpreter would eventually name one that is not there.
+pub async fn start(request: &Request, jobs: &mut Jobs, shell: &Path) -> Result<String, String> {
     let Some(command) = request.arg("command").filter(|c| !c.is_empty()) else {
         return Err("bash requires command".into());
     };
@@ -156,7 +159,9 @@ pub async fn start(request: &Request, jobs: &mut Jobs) -> Result<String, String>
         .await
         .map_err(|err| format!("bash failed to start: {err}"))?;
 
-    let mut child = Command::new("/bin/sh")
+    let mut child = Command::new(shell)
+        // `-c` is the one flag every shell worth choosing understands: bash, zsh,
+        // dash and ksh all take the command there.
         .arg("-c")
         .arg(command)
         // Never inherit the helper's stdin: it is the request stream, and a command
@@ -172,7 +177,15 @@ pub async fn start(request: &Request, jobs: &mut Jobs) -> Result<String, String>
         .process_group(0)
         .kill_on_drop(true)
         .spawn()
-        .map_err(|err| format!("bash failed to start: {err}"))?;
+        .map_err(|err| {
+            // Naming the shell is the point: `No such file or directory` on its own
+            // reads like something in the command was missing, not the interpreter.
+            format!(
+                "bash failed to start: {} could not be run: {}",
+                shell.display(),
+                files::err_message(&err)
+            )
+        })?;
 
     let pid = child.id().unwrap_or(0);
     let (sender, _receiver) = watch::channel(Status::default());
