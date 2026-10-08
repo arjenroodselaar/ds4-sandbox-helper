@@ -598,4 +598,30 @@ mod tests {
         assert!(text.contains("Search incomplete"), "{text}");
         assert!(text.contains("binary data or line exceeds"), "{text}");
     }
+
+    /// `MAX_DEPTH` counts entries below the root, a file included, so a file that deep
+    /// is read and one level deeper is not.  A search that hits the limit names the
+    /// path it left out.
+    #[tokio::test]
+    async fn a_tree_deeper_than_the_walk_limit_is_searched_as_far_as_the_limit() {
+        let temp = tempfile::TempDir::with_prefix("ds4-helper-deep-").unwrap();
+        let root = temp.path().to_path_buf();
+        // `inside` holds the deepest file the walk reads, `beyond` the first it does not.
+        let inside = (1..MAX_DEPTH).fold(root.clone(), |path, _| path.join("down"));
+        let beyond = inside.join("down");
+        std::fs::create_dir_all(&beyond).unwrap();
+        std::fs::write(inside.join("here.txt"), "needle inside the limit\n").unwrap();
+        std::fs::write(beyond.join("here.txt"), "needle past the limit\n").unwrap();
+
+        let text = search(&request(&format!(
+            r#""query":"needle","path":"{}""#,
+            root.display()
+        )))
+        .await
+        .unwrap();
+        assert!(text.contains("needle inside the limit"), "{text}");
+        assert!(!text.contains("needle past the limit"), "{text}");
+        assert!(text.contains("1 skipped paths"), "{text}");
+        assert!(text.contains("directory depth limit reached"), "{text}");
+    }
 }

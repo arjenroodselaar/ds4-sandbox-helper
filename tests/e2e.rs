@@ -21,6 +21,10 @@ use tokio::process::ChildStdin;
 use tokio::process::ChildStdout;
 use tokio::process::Command;
 
+/// The most the helper will accept in one request frame.  The crate is a binary, so a
+/// test cannot import this.
+const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+
 struct Helper {
     child: Child,
     stdin: ChildStdin,
@@ -693,6 +697,69 @@ async fn an_oversized_frame_that_stops_short_ends_the_session_with_a_reason() {
     let text = String::from_utf8_lossy(&output.stderr).into_owned();
     assert!(text.contains("stream ended after"), "{text}");
     assert!(text.contains("of 2000013 payload bytes"), "{text}");
+}
+
+/// The request limit is inclusive, so a frame of exactly `MAX_REQUEST_BYTES` is
+/// answered.  One byte larger is dropped with a notice, because there is no id in it
+/// for the helper to answer to.  The stream stays aligned, so the request after it is
+/// answered normally.
+#[tokio::test]
+async fn a_request_that_fills_the_size_limit_is_answered_and_one_more_byte_is_not() {
+    let (dir, _dir) = scratch("reqsize");
+    std::fs::write(dir.join("still-working.txt"), "x\n").unwrap();
+    let mut helper = Helper::start(&["--chdir", dir.to_str().unwrap()]).await;
+
+    // The filler is an argument the tool ignores, so the frame is still a request.
+    let padded = |id: i64, total: usize| -> String {
+        let head = format!(r#"{{"id":{id},"tool":"list","args":{{"pad":""#);
+        let tail = "\"}}";
+        assert!(
+            total > head.len() + tail.len(),
+            "the limit has to leave room for a frame"
+        );
+        format!(
+            "{head}{}{tail}",
+            "p".repeat(total - head.len() - tail.len())
+        )
+    };
+
+    let exact = padded(1, MAX_REQUEST_BYTES);
+    assert_eq!(exact.len(), MAX_REQUEST_BYTES);
+    helper
+        .stdin
+        .write_all(format!("{}\n", exact.len()).as_bytes())
+        .await
+        .unwrap();
+    helper.stdin.write_all(exact.as_bytes()).await.unwrap();
+    helper.stdin.flush().await.unwrap();
+    let answer = helper.one().await;
+    assert_eq!(answer["id"].as_i64(), Some(1), "{answer}");
+    assert!(answer["ok"].as_bool() == Some(true), "{answer}");
+
+    let over = padded(2, MAX_REQUEST_BYTES + 1);
+    assert_eq!(over.len(), MAX_REQUEST_BYTES + 1);
+    helper
+        .stdin
+        .write_all(format!("{}\n", over.len()).as_bytes())
+        .await
+        .unwrap();
+    helper.stdin.write_all(over.as_bytes()).await.unwrap();
+    helper.stdin.flush().await.unwrap();
+    let notice = helper.one().await;
+    assert_eq!(notice["id"].as_i64(), Some(0), "{notice}");
+    let text = notice["text"].as_str().unwrap_or_default();
+    assert!(
+        text.contains(&format!(
+            "of {} bytes exceeds the {MAX_REQUEST_BYTES} byte limit",
+            MAX_REQUEST_BYTES + 1
+        )),
+        "{notice}"
+    );
+
+    let after = helper.ok("list", serde_json::json!({"path": "."})).await;
+    assert!(after.contains("still-working.txt"), "{after}");
+
+    helper.finish().await;
 }
 
 #[tokio::test]
