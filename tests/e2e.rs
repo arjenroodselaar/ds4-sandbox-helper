@@ -1,13 +1,9 @@
 //! End-to-end tests: the real binary, real pipes, real files, real processes.
 //!
-//! These drive the helper exactly as `ds4-agent --sandbox` does — framed JSON on
-//! stdin, framed JSON on stdout — so they check the thing unit tests cannot: that the
-//! byte counts agree with the payloads, that a response always arrives for a request,
-//! and that a tool's answer survives the trip through the protocol without losing its
-//! shape.  A helper that passes its own module tests but whose framing is off by one
-//! byte would hang the agent, and only a test like this one notices.
-//!
-//! The codec here is written again on purpose: an integration test that imported the
+//! These drive the helper exactly as `ds4-agent --sandbox` does — framed JSON both
+//! ways — so they check what unit tests cannot: that byte counts agree with payloads,
+//! that every request gets a reply, and that a tool's answer keeps its shape through
+//! the protocol.  The codec is written again here on purpose: a test that imported the
 //! binary's own encoder could not catch an encoder that disagrees with the spec.
 
 use std::os::unix::fs::PermissionsExt;
@@ -70,8 +66,8 @@ impl Helper {
     async fn start(args: &[&str]) -> Helper {
         let mut child = Command::new(env!("CARGO_BIN_EXE_ds4-sandbox-helper"))
             .args(args)
-            // Which shell a run with no option executes with is a question about the
-            // sandbox, not about whoever happens to have DS4_SHELL exported.
+            // Which shell a run with no option uses is a question about the sandbox,
+            // not about whoever exported DS4_SHELL.
             .env_remove("DS4_SHELL")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -91,9 +87,8 @@ impl Helper {
             stdout,
             next_id: 0,
         };
-        // The first frame is the helper's own startup notice, and it has to arrive
-        // before a byte is written: the agent blocks on the word ready, so a hello
-        // that waited for a request would be a startup that never ends.
+        // The startup notice has to arrive before a byte is written: the agent blocks
+        // on the word ready, so a hello that waited for a request would never start.
         let first = helper.one().await;
         assert_eq!(
             first["id"].as_i64(),
@@ -106,8 +101,7 @@ impl Helper {
             hello.to_ascii_lowercase().contains("ready"),
             "the startup notice has to contain the word ready: {hello}"
         );
-        // The notice is also where a run says which shell it executes with, which is
-        // the one thing about a sandbox that a request cannot find out for itself.
+        // The notice is also where a run says which shell it executes with.
         assert!(
             hello.contains("shell "),
             "the notice names no shell: {hello}"
@@ -130,9 +124,8 @@ impl Helper {
         serde_json::from_slice(&payload).unwrap_or_else(|err| panic!("frame is not JSON: {err}"))
     }
 
-    /// Reads the next frame that answers something.  A helper may speak on its own
-    /// initiative at any point, and the agent treats those as notices rather than as
-    /// replies, so the test has to do the same and keep looking.
+    /// Reads the next frame that answers something, skipping anything the helper
+    /// volunteers on its own, which the agent also treats as a notice.
     async fn frame(&mut self) -> serde_json::Value {
         loop {
             let value = self.one().await;
@@ -150,10 +143,9 @@ impl Helper {
             .await
     }
 
-    /// Sends a request frame that carries more than a tool and its arguments.  The
-    /// agent puts things the tool cannot work out for itself — how big the model's
-    /// context is, for one — at the top level of the frame, where they sit beside
-    /// `id` rather than inside `args`.
+    /// Sends a request frame carrying more than a tool and its arguments: the agent
+    /// puts what a tool cannot work out for itself (the model's context size, say) at
+    /// the top level, beside `id` rather than inside `args`.
     async fn request(&mut self, mut frame: serde_json::Value) -> serde_json::Value {
         self.next_id += 1;
         let id = self.next_id;
@@ -208,18 +200,15 @@ impl Helper {
             stdout,
             ..
         } = self;
-        // stdout has to go before stdin: some operating systems wake a blocked reader
-        // before they deliver EOF on the other direction, and the helper would keep
-        // reading frames otherwise.
+        // stdout has to go before stdin: some systems wake a blocked reader before
+        // delivering EOF the other way, and the helper would keep reading frames.
         drop(stdout);
         drop(stdin);
         child.wait().await.expect("wait for the helper")
     }
 }
 
-/// A directory for one test to make its mess in, deleted when the test ends.  The
-/// caller keeps it by holding the second half of the pair, which is what the
-/// underscore in front of its name means.
+/// A directory for one test to make its mess in; the caller keeps it alive.
 fn scratch(tag: &str) -> (std::path::PathBuf, tempfile::TempDir) {
     let dir = tempfile::TempDir::with_prefix(format!("ds4-helper-e2e-{tag}-"))
         .expect("scratch directory");
@@ -430,10 +419,9 @@ async fn a_fast_command_comes_back_with_its_output() {
 async fn a_slow_command_keeps_running_until_it_is_stopped() {
     let mut helper = Helper::start(&[]).await;
 
-    // A job that will outlast the shortest wait the tool allows: the first
-    // snapshot comes back while it is still running, which is how a long build is
-    // started.  (`refresh_sec` is clamped to at least one second, as it is by the
-    // agent, so this is the shortest possible wait.)
+    // A job that outlasts the shortest wait the tool allows, so the first snapshot
+    // comes back while it is still running — which is how a long build is started.
+    // (`refresh_sec` is clamped to a second, as it is by the agent.)
     let started = helper
         .ok(
             "bash",
@@ -455,8 +443,7 @@ async fn a_slow_command_keeps_running_until_it_is_stopped() {
         .expect("an output path")
         .to_string();
     assert!(std::path::Path::new(&spool).exists(), "spool file gone");
-    // Named the way the agent names its own command output, so a sandbox log and an
-    // agent log say the same thing to whoever is reading them.
+    // Named the way the agent names its own command output, so both logs read alike.
     assert!(
         std::path::Path::new(&spool)
             .file_name()
@@ -482,8 +469,7 @@ async fn a_slow_command_keeps_running_until_it_is_stopped() {
         "{stopped}"
     );
 
-    // The job and its spool file are gone once the model has been shown the end:
-    // the sandbox is not a place to accumulate state between runs.
+    // The job and its spool file are gone once the model has been shown the end.
     let gone = helper
         .fail("bash_status", serde_json::json!({"job": job.as_str()}))
         .await;
@@ -493,9 +479,9 @@ async fn a_slow_command_keeps_running_until_it_is_stopped() {
     helper.finish().await;
 }
 
-/// What `refresh_sec` means on a stop: how long the helper may take, not how long
-/// it takes.  A command that ignores `SIGTERM` is killed by the follow-up signal,
-/// and the answer goes out when it is reaped rather than at the deadline.
+/// What `refresh_sec` means on a stop: how long the helper may take, not how long it
+/// takes.  A command that ignores `SIGTERM` is killed by the follow-up and answered
+/// when it is reaped, not at the deadline.
 #[tokio::test]
 async fn the_wait_a_stop_asks_for_is_a_ceiling_not_a_delay() {
     let mut helper = Helper::start(&[]).await;
@@ -553,9 +539,8 @@ async fn a_command_that_ignores_its_deadline_is_killed() {
 
 #[tokio::test]
 async fn a_shell_cannot_read_the_request_stream() {
-    // The helper's stdin is the agent's frame stream.  A command that inherited it
-    // would consume the next request and the session would desynchronise, which is
-    // the single most dangerous thing a sandbox tool can do.
+    // The helper's stdin is the agent's frame stream: a command that inherited it
+    // would eat the next request and desynchronise the session.
     let mut helper = Helper::start(&[]).await;
     let text = helper
         .ok(
@@ -574,10 +559,8 @@ async fn a_shell_cannot_read_the_request_stream() {
     helper.finish().await;
 }
 
-/// Which shell is used to execute a command is settled when the helper starts, and
-/// `$0` is the cheapest way to ask a shell which shell it is: it is the name the shell
-/// was started with.  Bash is the answer wherever the sandbox has it, because that is
-/// the shell a model writes its commands for.
+/// Which shell executes a command is settled when the helper starts, and `$0` is the
+/// cheapest way to ask a shell which shell it is: the name it was started with.
 #[tokio::test]
 async fn a_command_is_executed_with_bash_when_nothing_is_chosen() {
     let expected = if Path::new("/bin/bash").exists() {
@@ -602,15 +585,14 @@ async fn a_shell_named_without_a_slash_is_resolved_by_the_exec_call() {
     let answer = helper
         .ok("bash", serde_json::json!({"command": "echo $0"}))
         .await;
-    // The name that was asked for rather than the file PATH found, because that is
-    // what exec hands over, and it is the proof the shell came from the option.
+    // The name asked for rather than the one PATH found: proof the shell came from
+    // the option.
     assert!(answer.contains("<output>\nsh\n</output>"), "{answer}");
     helper.finish().await;
 }
 
 /// A script that is not a shell at all is the clearest proof of the choice: it answers
-/// with what it was handed, and nothing but the shell named at startup could have
-/// handed it over that way.
+/// with what it was handed, and only the shell named at startup hands it over that way.
 #[tokio::test]
 async fn the_shell_named_at_startup_is_the_one_used_to_execute_a_command() {
     let (dir, _dir) = scratch("shell");
@@ -726,8 +708,8 @@ async fn a_relative_path_is_answered_from_the_directory_asked_for_at_start() {
         .await;
     assert!(answer.contains("one"), "{answer}");
 
-    // A shell started by `bash` begins in the same place, which is the reason the
-    // flag is worth having: no command has to name the root of the session.
+    // A shell started by `bash` begins in the same place: no command has to name the
+    // root of the session.
     let answer = helper
         .ok("bash", serde_json::json!({"command": "cat inside.txt"}))
         .await;
@@ -742,9 +724,8 @@ async fn a_relative_path_is_answered_from_the_directory_asked_for_at_start() {
     helper.finish().await;
 }
 
-/// A directory that cannot be worked in is a mistake in the command line, so the
-/// helper leaves before reading a frame, saying the agent's own complaint on stderr
-/// and printing nothing on the channel the agent reads.
+/// A directory that cannot be worked in is a mistake in the command line: the helper
+/// leaves before reading a frame, saying the agent's own complaint on stderr.
 #[tokio::test]
 async fn a_chdir_that_cannot_be_done_stops_before_the_first_frame() {
     let child = Command::new(env!("CARGO_BIN_EXE_ds4-sandbox-helper"))
@@ -831,9 +812,8 @@ async fn the_read_size_that_comes_with_the_request_wins() {
     let text = told["result"].as_str().unwrap_or_default().to_string();
     assert!(text.contains("lines 1-7 (partial read)"), "{text}");
 
-    // `more` takes its size from the same place, so a resumed read does not
-    // suddenly change width in the middle of a file.  The `max_bytes` beside it is a
-    // cap this helper does not implement, and is ignored rather than fatal.
+    // `more` takes its size from the same place, so a resumed read does not change
+    // width mid-file.  `max_bytes` is a cap this helper does not implement: ignored.
     let resumed = helper
         .request(
             serde_json::json!({"tool":"more","limits":{"read_lines":2,"max_bytes":100},"args":{}}),
@@ -849,8 +829,7 @@ async fn the_read_size_that_comes_with_the_request_wins() {
     assert!(untold.contains("lines 1-3 (partial read)"), "{untold}");
 
     // The size is capped: a frame may ask for a lot, but not for everything.  The
-    // number is written out here because a test of a binary cannot import its
-    // constants, and a ceiling nobody wrote down twice is not checked at all.
+    // ceiling is written out here because a test of a binary cannot import it.
     const CAP: usize = 500;
     let greedy = helper
         .request(

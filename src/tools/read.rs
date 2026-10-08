@@ -1,16 +1,12 @@
 //! `read` and `more`, ported from `agent_read_range_from()`.
 //!
-//! The interesting part is not the header, it is the pair of numbers in the
-//! truncation note.  A model that gets `[Read truncated. continue_offset=412;
-//! continue_byte_offset=18344. Call more to continue.]` can ask for exactly the
-//! next chunk, and `more` can resume from a byte offset instead of re-reading and
-//! re-discarding 400 lines.  A resumed chunk may start in the middle of a line, and
-//! saying so ("(continued)") is what stops the model from reading the first line of
-//! its answer as if it were a whole line.
+//! The interesting part is the pair of numbers in the truncation note: they let the
+//! model ask for exactly the next chunk, and let `more` resume from a byte offset
+//! instead of re-reading what was discarded.  A resumed chunk can start mid-line, and
+//! "(continued)" says so.
 //!
-//! Bytes are streamed, not slurped: the agent reads a 2 GB log file's first 120
-//! lines every day, and a sandbox that buffered the file to find line 120 would be
-//! the first thing the outer sandbox killed.
+//! Bytes are streamed, not slurped: a sandbox that buffered a 2 GB log to find line
+//! 120 would be the first thing the outer sandbox killed.
 
 use std::fmt::Write as _;
 use std::io::SeekFrom;
@@ -22,12 +18,10 @@ use crate::budget::MAX_TOOL_BYTES;
 use crate::budget::NOTE_MARGIN;
 use crate::files;
 
-/// Room the body may use before the read stops.  The header and the resume note
-/// are written afterwards, which is why the body stops short of the real limit.
+/// Room the body may use; the header and the resume note are written afterwards.
 const BODY_LIMIT: usize = MAX_TOOL_BYTES - NOTE_MARGIN;
 
-/// Where the next `more` resumes.  The C agent keeps this on its worker; the
-/// sandbox owns it here, which is the only reason `more` can be served remotely.
+/// Where the next `more` resumes.
 #[derive(Debug, Clone)]
 pub struct MoreState {
     pub path: String,
@@ -37,13 +31,9 @@ pub struct MoreState {
     pub bare: bool,
 }
 
-/// A byte cursor with one byte of look-ahead and a running position, which is what
-/// the resume offset has to be measured in.
-///
-/// The look-ahead is the buffered reader's own buffer rather than a held byte: the
-/// two things this file does with a byte it has not consumed are ask what comes
-/// next (a CRLF's second half, or whether the file has ended) and then either take
-/// it or not, which is exactly what `fill_buf` and `consume` are.
+/// A byte cursor with look-ahead and a running position, which is what the resume
+/// offset is measured in.  The look-ahead is the buffered reader's own buffer:
+/// peek at the next byte, then take it or not.
 struct Cursor {
     source: tokio::io::BufReader<tokio::fs::File>,
     pos: usize,
@@ -75,9 +65,8 @@ impl Cursor {
     }
 }
 
-/// Reads `max_lines` lines starting at `start_line`, from `offset` bytes into the
-/// file.  `mid_line` says the offset is not at a line start, which is true only for
-/// a resumed read.
+/// Reads `max_lines` lines from `start_line`, from `offset` bytes into the file.
+/// `mid_line` marks a resumed read whose offset is not at a line start.
 #[allow(clippy::too_many_arguments)]
 pub async fn read_range(
     path: &str,
@@ -91,8 +80,8 @@ pub async fn read_range(
     set_more: bool,
 ) -> Result<String, String> {
     if path.is_empty() {
-        // The C agent returns before it has touched anything, resume state
-        // included, so the previous read is still the one `more` would continue.
+        // Nothing is touched, resume state included, so `more` still continues the
+        // last good read.
         return Err("read requires path".into());
     }
     let result = read_inner(
@@ -100,8 +89,7 @@ pub async fn read_range(
     )
     .await;
     if result.is_err() && set_more {
-        // A failed read leaves nothing to continue.  Keeping a stale offset would
-        // silently repeat or skip a chunk of the last successful read.
+        // A failed read leaves nothing to continue.
         *more = None;
     }
     result
@@ -127,8 +115,7 @@ async fn read_inner(
     let max_lines = std::cmp::max(max_lines, 1) as usize;
     let mut line = if offset > 0 { start_line } else { 1 };
 
-    // Walk past the lines we were not asked for.  This reads them, but only one
-    // byte at a time through a buffer, and never holds them.
+    // Walk past the lines we were not asked for, without holding them.
     while line < start_line {
         let Some(byte) = cur.byte().await.map_err(io_failure)? else {
             break;
@@ -156,20 +143,16 @@ async fn read_inner(
             break;
         };
         if body.len() >= BODY_LIMIT && (byte & 0xc0 != 0x80 || body.len() >= BODY_LIMIT + 3) {
-            // Out of room.  A continuation byte is allowed three more bytes so a
-            // multi-byte character finishes instead of arriving as half a glyph.
+            // Three more bytes for a continuation byte, so no glyph is cut in half.
             break;
         }
         if byte == 0 {
-            // Half a binary file in the model's context is not a document, and the
-            // bytes are useless for anything the model would do with them.
+            // Half a binary file is not a document.
             stopped = Some("read encountered binary data");
             break;
         }
         cur.byte().await.map_err(io_failure)?;
-        // Recorded before the line's bytes are written: a file that ends with a
-        // newline has already counted the empty line after it, and reporting that
-        // would put a line in the header that the body does not contain.
+        // Counted before the line is written, so a trailing newline is not a phantom line.
         last_line = line.max(last_line);
         if prefix && !bare {
             let mut label = String::new();
@@ -192,9 +175,7 @@ async fn read_inner(
                 cur.byte().await.map_err(io_failure)?;
             }
             if !bare || crlf {
-                // Normalised: the model should see one line ending, not a stray
-                // control character that its own tools will not recognise.  Bare
-                // mode keeps the bytes it was given and adds nothing.
+                // One line ending for the model; bare mode keeps the bytes it was given.
                 body.push(b'\n');
             }
             line += 1;
@@ -237,8 +218,7 @@ async fn read_inner(
             if last_line > 0 { start_line } else { 0 }
         );
     }
-    // The file's bytes are the answer; a file that is not valid UTF-8 gets
-    // replacements here rather than a JSON encoder that cannot encode it at all.
+    // Invalid UTF-8 gets replacements rather than an encoder that cannot encode it.
     out.push_str(&String::from_utf8_lossy(&body));
     if more_to_come {
         let _ = write!(
@@ -287,8 +267,7 @@ fn io_failure(err: std::io::Error) -> String {
 mod tests {
     use super::*;
 
-    /// A file holding `bytes`, in a directory that deletes itself with the test.  The
-    /// caller keeps the directory by holding the second half of the pair.
+    /// A file holding `bytes` in a self-deleting directory; the caller keeps the directory.
     fn write_file(tag: &str, bytes: &[u8]) -> (std::path::PathBuf, tempfile::TempDir) {
         let dir = tempfile::TempDir::with_prefix(format!("ds4-helper-read-{tag}-")).unwrap();
         let path = dir.path().join("file");

@@ -1,13 +1,7 @@
 //! ds4-sandbox-helper: the sandbox side of `ds4-agent --sandbox`.
 //!
-//! Reads framed requests from stdin and writes framed responses to stdout, running
-//! the tools the agent routes: read, more, write, edit, list, search, bash,
-//! bash_status, bash_stop.  Nothing else is written to stdout.  Diagnostics go to
-//! stderr, which the agent drains, keeps a tail of, and mirrors next to --trace;
-//! anything a tool learned that belongs in front of the model is in its result text,
-//! because that is the only channel the model reads.
-//!
-//! The protocol this speaks is specified in ds4's docs/SANDBOX.md.
+//! Framed requests on stdin, framed answers on stdout, and nothing else on stdout.
+//! Diagnostics go to stderr.  The protocol is specified in ds4's docs/SANDBOX.md.
 
 mod budget;
 mod files;
@@ -27,26 +21,20 @@ use tools::BASH_SHELL;
 use tools::Config;
 use tools::FALLBACK_SHELL;
 
-// The command line, which is also what --help prints.  The doc comment on the struct
-// would become help text, and these two fields are not the sort of thing to tell a
-// user about, so the words below are chosen for the reader instead.
+// Doc comments on these fields are what --help prints.
 #[derive(Debug, Parser)]
 #[command(
     version,
     about = "run tools for ds4-agent --sandbox",
     long_about = "Run tools for a ds4-agent that has no filesystem or shell of its own.\n\
         \n\
-        Everything the model asks for arrives with the request, as does everything the \
-        agent knows about the model; the options below are what is left, which is what \
-        only whoever started this helper can decide.",
+        The agent sends everything a tool needs with the request.  What is left is what \
+        only whoever starts this helper can decide: the shell, the working directory, \
+        and the read size for a sender that states no limit.",
     after_help = after_help(),
 )]
 struct Args {
-    /// Lines a read returns when max_lines is omitted
-    ///
-    /// The agent works its own number out from the size of the model's context and
-    /// sends it with every request, which is the only way either side can know it,
-    /// so this is the answer for a sender that says nothing: a person at a terminal.
+    /// Lines a read returns when the request gives no max_lines
     #[arg(
         long,
         value_name = "N",
@@ -56,18 +44,14 @@ struct Args {
     )]
     read_lines: i64,
 
-    /// Allow the [upto] anchor in an edit's old text
-    ///
-    /// It matches everything between two anchors, which can delete a great deal at
-    /// once, so it is opt-in.  Matches an agent started with --edit-upto.
+    /// Accept the [upto] anchor in an edit's old text, which can delete a great deal
     #[arg(
         long,
         env = "DS4_EDIT_UPTO",
         action = ArgAction::Set,
         num_args(0..=1),
         value_name = "BOOL",
-        // Booleans only: the parser also accepts yes/no/on/off/1/0, so listing the
-        // two it prints as "possible values" would understate what it takes.
+        // The parser also takes yes/no/on/off/1/0, so possible values would understate it.
         hide_possible_values = true,
         default_missing_value = "true",
         default_value_t = false,
@@ -75,25 +59,13 @@ struct Args {
     )]
     edit_upto: bool,
 
-    /// The shell used to execute a command
+    /// Shell used to run a command, as <shell> -c <command>
     ///
-    /// Commands requested by the agent are executed as  `<shell> -c <command>`. When
-    /// not explicitly provided the helper uses `/bin/bash` or falls back to `/bin/sh`
-    /// if not available.
+    /// Default: /bin/bash, or /bin/sh where that is not available
     #[arg(long, value_name = "SHELL", env = "DS4_SHELL")]
     shell: Option<PathBuf>,
 
     /// Work in DIR instead of the directory this was started in
-    ///
-    /// The agent's own --chdir, for whoever starts this helper directly: every
-    /// relative path in a request, and the directory `bash` commands begin in, is
-    /// resolved there.  It happens before the first frame is read, so there is no
-    /// moment when the answer to a relative path could come from somewhere else.
-    ///
-    /// There is no environment variable for it, unlike the options above.  A directory
-    /// inherited through the environment would be entered twice over for a helper the
-    /// agent had already moved, and a relative one would then mean somewhere else
-    /// entirely.
     #[arg(long, value_name = "DIR")]
     chdir: Option<PathBuf>,
 }
@@ -108,9 +80,7 @@ impl Args {
     }
 }
 
-/// The part of the help text that cannot be written where it is used, because it
-/// names the tools the dispatch actually serves: the help cannot then claim to
-/// serve one that the router does not have.
+/// The tool list comes from the router, so --help cannot name a tool it lacks.
 fn after_help() -> String {
     format!(
         "Arguments are read from stdin as '<byte count>\\n<json>' and answers are\n\
@@ -126,11 +96,7 @@ fn after_help() -> String {
     )
 }
 
-/// Moves the process into `dir`, checked and complained about in the same two steps
-/// and the same words as `ds4-agent --chdir`: a launch that ended up somewhere else
-/// would answer every later question about the wrong files, and nothing in a frame
-/// would show it.  A directory the person named is not there is a mistake in the
-/// command line, so it leaves with status 1 and no frame on stdout.
+/// Move the process into `dir`, with the same complaints as `ds4-agent --chdir`.
 fn enter(dir: &Path) -> Result<(), String> {
     match std::fs::metadata(dir) {
         Err(err) => Err(format!(
@@ -149,16 +115,13 @@ fn enter(dir: &Path) -> Result<(), String> {
     }
 }
 
-/// Whether `path` names something this process could exec: a file with an execute
-/// bit, followed through a symlink because that is what exec does with one.
+/// Whether `path` is an executable file, symlinks followed as exec follows them.
 fn can_run(path: &Path) -> bool {
     std::fs::metadata(path)
         .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
 }
 
-/// The shell used to execute a command, using the `preferred` where this sandbox can
-/// run it, and `fallback` where it cannot. This function only uses a `stat` rather than
-/// a test run to determine if the given paths are valid.
+/// `preferred` if this sandbox can run it, else `fallback`.  A stat, not a test run.
 fn pick_shell(preferred: &Path, fallback: &Path) -> PathBuf {
     if can_run(preferred) {
         preferred.to_path_buf()
@@ -167,12 +130,11 @@ fn pick_shell(preferred: &Path, fallback: &Path) -> PathBuf {
     }
 }
 
-/// Select the from the default shell options based on availablity in the sandbox.
 fn default_shell() -> PathBuf {
     pick_shell(Path::new(BASH_SHELL), Path::new(FALLBACK_SHELL))
 }
 
-/// Check whether or not the shell at the given path can run.
+/// A shell with no slash is left for PATH to resolve at exec time; a path is checked now.
 fn check_shell(shell: &Path) -> Result<(), String> {
     if shell.as_os_str().is_empty() {
         return Err("invalid shell: the name is empty".into());
@@ -195,8 +157,6 @@ fn check_shell(shell: &Path) -> Result<(), String> {
 }
 
 fn main() -> ExitCode {
-    // Help and version print and exit successfully; an argument that cannot be read
-    // prints a usage line and exits 2, which is the status the help text promises.
     let args = Args::parse();
     if let Some(dir) = &args.chdir
         && let Err(message) = enter(dir)
@@ -210,8 +170,7 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    // enable_all: the tools wait on pipes, on child processes, and on timers, and a
-    // runtime that has not enabled an driver refuses to wait on any of them.
+    // The tools wait on pipes, on child processes, and on timers.
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -245,19 +204,16 @@ mod tests {
     use clap::CommandFactory;
     use clap::error::ErrorKind;
 
-    /// Parsing looks at the environment as well as the command line, and tests run in
-    /// parallel against one copy of the environment, so every test here takes this
-    /// lock and holds it for as long as it is parsing or changing variables.
+    /// Parsing reads the environment, tests run in parallel, and there is one copy of
+    /// it per process, so every test here holds this lock while parsing.
     static ENV: Mutex<()> = Mutex::new(());
 
     const READ_VAR: &str = "DS4_READ_LINES";
     const UPTO_VAR: &str = "DS4_EDIT_UPTO";
     const SHELL_VAR: &str = "DS4_SHELL";
 
-    /// `list` is the command line after the program name.
-    ///
-    /// The caller holds `ENV`, which is why it is passed in: holding it is the proof
-    /// that nothing else in this process is reading the environment concurrently.
+    /// `list` is the command line after the program name.  The `ENV` guard is passed in
+    /// as proof that nothing else in the process is touching the environment.
     fn args_from(list: &[&str], _env: &MutexGuard<'_, ()>) -> Result<Args, clap::Error> {
         Args::try_parse_from(std::iter::once(env!("CARGO_PKG_NAME")).chain(list.iter().copied()))
     }
@@ -266,8 +222,7 @@ mod tests {
         args_from(list, env).map(|args| args.config())
     }
 
-    /// Runs `body` with none of the variables set, and puts back what was there.  What
-    /// the defaults are is only observable when the developer exporting them is not.
+    /// Runs `body` with none of the variables set, then puts back what was there.
     ///
     /// # Safety
     /// Mutating the environment is unsound while another thread reads it, which is
@@ -303,8 +258,6 @@ mod tests {
             "{shell:?} is neither of the two shells this knows about"
         );
 
-        // No directory asked for means the one the process was started in, which is
-        // the only answer that does not need this program to have an opinion.
         assert_eq!(args.chdir, None);
     }
 
@@ -319,8 +272,6 @@ mod tests {
                 "{spelling:?}"
             );
         }
-        // A flag that names no directory is a mistake in the command line, not a
-        // request to stay where the launcher happened to be.
         assert!(args_from(&["--chdir"], &env).is_err());
     }
 
@@ -338,8 +289,6 @@ mod tests {
             80
         );
         assert!(config_from(&["--edit-upto"], &env).unwrap().edit_upto);
-        // The same switch can be turned back off on the command line, which is how
-        // one turns off what the environment turned on.
         assert!(!config_from(&["--edit-upto=false"], &env).unwrap().edit_upto);
     }
 
@@ -355,8 +304,6 @@ mod tests {
         assert_eq!(config.read_lines, 240);
         assert!(config.edit_upto);
         assert_eq!(config.shell, PathBuf::from("/bin/bash"));
-        // A command line outranks the environment, which is what makes the variable
-        // a default rather than an override.
         assert_eq!(
             config_from(&["--read-lines", "60"], &env)
                 .unwrap()
@@ -389,13 +336,8 @@ mod tests {
         }
     }
 
-    /// The two complaints `ds4-agent --chdir` makes, in its words: a person reading
-    /// them has to be able to tell "not there" from "not a directory".
-    ///
-    /// Only the failures are tried here.  Succeeding would move the working directory
-    /// of this whole test process, and the other tests in it are running in parallel
-    /// with paths of their own; the success path is what the end-to-end test does in a
-    /// process of its own.
+    /// Only the failures are tried: succeeding would move this test process's working
+    /// directory out from under the other tests.  The end-to-end test covers success.
     #[test]
     fn a_directory_that_cannot_be_worked_in_is_named_before_anything_runs() {
         let scratch = tempfile::TempDir::with_prefix("ds4-helper-chdir-").unwrap();
@@ -429,18 +371,13 @@ mod tests {
                 "{spelling:?}"
             );
         }
-        // A name without a slash is carried through as it was written: PATH is what
-        // resolves it, at the moment the command is spawned.
         assert_eq!(
             config_from(&["--shell", "zsh"], &env).unwrap().shell,
             PathBuf::from("zsh")
         );
-        // A flag that names no shell is a mistake in the command line, not a request
-        // for the shell a run with no option would have settled on.
         assert!(config_from(&["--shell"], &env).is_err());
     }
 
-    /// Test the process of resolving the default shell.
     #[test]
     fn the_shell_nobody_named_is_bash_where_bash_can_run() {
         let scratch = tempfile::TempDir::with_prefix("ds4-helper-pick-").unwrap();
@@ -450,7 +387,7 @@ mod tests {
         std::fs::write(&fallback, "#!/bin/sh\n").unwrap();
         std::fs::set_permissions(&fallback, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        // There is a file called bash here and it is not something to run.
+        // A file named bash that is not executable.
         assert_eq!(pick_shell(&bash, &fallback), fallback);
 
         std::fs::set_permissions(&bash, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -459,7 +396,7 @@ mod tests {
         // A directory has execute bits of its own and is not a shell.
         assert_eq!(pick_shell(scratch.path(), &fallback), fallback);
 
-        // The real look, in whichever direction this sandbox answers it.
+        // And the real filesystem, whichever way it answers.
         let chosen = default_shell();
         assert_eq!(
             chosen == Path::new(BASH_SHELL),
@@ -467,8 +404,6 @@ mod tests {
         );
     }
 
-    /// The complaints `check_shell` makes, in its words: whoever reads one has to be
-    /// able to tell "not there" from "not a file" and from "not executable".
     #[test]
     fn a_shell_that_cannot_run_is_named_before_anything_runs() {
         let scratch = tempfile::TempDir::with_prefix("ds4-helper-shell-").unwrap();
@@ -495,16 +430,13 @@ mod tests {
             format!("{} is not a file", scratch.path().display())
         );
 
-        // A bare name is accepted whatever is on PATH, because the answer here would
-        // be a second, differently obtained answer to the exec call's question.
+        // A bare name is accepted whatever is on PATH: exec is the one that answers.
         assert!(check_shell(Path::new("no-such-shell-anywhere")).is_ok());
     }
 
     #[test]
     fn help_and_version_are_not_session_starts() {
         let _env = ENV.lock().unwrap();
-        // Both are the parse failing with a request to print something, which is how
-        // the binary exits successfully without reading a frame.
         for (flag, kind) in [
             ("--help", ErrorKind::DisplayHelp),
             ("-h", ErrorKind::DisplayHelp),
@@ -529,8 +461,6 @@ mod tests {
         ] {
             assert!(help.contains(expected), "help does not mention {expected}");
         }
-        // The after-help is where the tool list lives, and it is built from the
-        // router rather than typed twice.
         let long = Args::command().render_long_help().to_string();
         for tool in tools::SANDBOX_TOOLS {
             assert!(long.contains(tool), "help does not list {tool}");

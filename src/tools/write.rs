@@ -8,8 +8,7 @@ pub async fn write(request: &Request) -> Result<String, String> {
         return Err("write requires path".into());
     };
     let Some(content) = request.arg("content") else {
-        // An empty string is a real request to truncate; an absent argument is the
-        // model forgetting the parameter, and the two must not do the same thing.
+        // "" is a request to truncate; an absent argument is the model forgetting it.
         return Err("write requires content".into());
     };
     files::replace(path, content.as_bytes().to_vec(), None).await?;
@@ -25,9 +24,7 @@ mod tests {
         parse_request(format!(r#"{{"id":1,"tool":"write","args":{{{args}}}}}"#).as_bytes()).unwrap()
     }
 
-    /// A file path inside a fresh directory that deletes itself with the test.  The
-    /// caller holds the directory by keeping the second half of the pair, which is
-    /// what the underscore in front of its name means.
+    /// A file path in a self-deleting directory; the caller keeps the directory.
     fn temp(tag: &str) -> (String, tempfile::TempDir) {
         let dir = tempfile::TempDir::with_prefix(format!("ds4-helper-write-{tag}-")).unwrap();
         (dir.path().join("file").to_str().unwrap().to_string(), dir)

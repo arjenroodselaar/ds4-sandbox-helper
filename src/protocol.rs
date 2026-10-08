@@ -1,27 +1,19 @@
 //! The two message shapes carried inside frames, and the strictness that goes
 //! with them.
 //!
-//! A frame is read for exactly two things: the `id` it answers and the text to
-//! report.  Everything else is ignored on purpose, which is what lets a sandbox
-//! grow its protocol without breaking an agent that never learned the new field.
-//! The exceptions are the fields that carry meaning we cannot do without: a frame
-//! with no numeric `id` cannot be matched to a request, and a response with no
-//! boolean `ok` cannot be told from a successful one, so both end the session
-//! rather than being guessed at.
+//! A frame is read for its `id` and its text; everything else is ignored so either
+//! side can grow.  A frame with no numeric `id`, or a response with no boolean `ok`,
+//! ends the session rather than being guessed at.
 
 use serde_json::Value;
 use serde_json::json;
 use std::collections::BTreeMap;
 
-/// The most lines a request may ask a bare `read` or `more` to return.  It is the
-/// agent's own largest default, so the cap costs nothing in practice and keeps a
-/// hand-written frame from asking for the file and then some.
+/// Most lines a request may ask a bare `read` or `more` to return.
 pub const MAX_INJECTED_READ_LINES: i64 = 500;
 
-/// A request from the agent.  Every argument value is a string, numbers and
-/// booleans included, because that is what a parsed tool call holds: there is
-/// nothing to un-quote.  Keeping the type that way also means the sandbox decides
-/// what `"timeout_sec":"30"` means, not the process that sent it.
+/// A request from the agent.  Every argument value is a string, numbers and booleans
+/// included, so the sandbox decides what `"timeout_sec":"30"` means.
 #[derive(Debug, Clone)]
 pub struct Request {
     pub id: i64,
@@ -31,19 +23,12 @@ pub struct Request {
     pub limits: Limits,
 }
 
-/// The `limits` object of a request: what the sender is allowed to tell us about
-/// the model on the other side of the pipe, kept apart from `args` because it is
-/// not model input and does not have to be a string.
-///
-/// A member that is absent says nothing, and a member this version does not know is
-/// ignored rather than rejected, so a newer agent can name another cap without
-/// ending the session of an older helper.
+/// The `limits` object of a request: what the sender says about the model, kept apart
+/// from `args` because it is not model input and is not all strings.  A member this
+/// version does not know is ignored rather than rejected.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Limits {
-    /// How much a `read` or `more` that was not told a size should return, in
-    /// lines.  The agent knows this and we cannot: it follows the size of the model
-    /// context this session is filling, and a helper that guessed would either
-    /// overflow a small model or starve a big one.
+    /// Lines a `read` or `more` with no size should return.
     pub read_lines: Option<i64>,
 }
 
@@ -59,16 +44,13 @@ impl Limits {
 }
 
 impl Request {
-    /// The value of `key`, or `None` when the argument was omitted.  Absent and
-    /// empty are different things to these tools: `""` was written by the model.
+    /// The value of `key`, or `None` when it was omitted: `""` was written by the model.
     pub fn arg(&self, key: &str) -> Option<&str> {
         self.args.get(key).map(String::as_str)
     }
 
-    /// An argument as a number of lines, seconds or results, falling back to the
-    /// tool's default when it is absent *or* unreadable.  The C agent is generous
-    /// here because the values come from a language model: a model that writes
-    /// `"max_lines": "plenty"` must not lose the whole call.
+    /// An argument as a number, clamped.  Absent or unreadable falls back to `default`,
+    /// because a model that writes `"plenty"` must not lose the whole call.
     pub fn arg_or(&self, key: &str, default: i64, min: i64, max: i64) -> i64 {
         match self.arg(key).and_then(|v| v.trim().parse::<i64>().ok()) {
             Some(v) => v.clamp(min, max),
@@ -76,14 +58,8 @@ impl Request {
         }
     }
 
-    /// The size to answer a bare `read` or `more` with.
-    ///
-    /// The number the agent sends wins, because it is the only one of the two that
-    /// knows what the model can hold; `fallback` is the helper's own setting, used
-    /// when the sender says nothing, which in practice means a person driving this
-    /// by hand.  What arrives is capped, because a helper that lets the other end ask
-    /// for ten million lines has handed its output limit to whoever sent it, and
-    /// 500 is the largest size the agent itself will ever ask for.
+    /// The size for a bare `read` or `more`: the sender's number wins, capped at
+    /// `MAX_INJECTED_READ_LINES`, and `fallback` covers a sender that says nothing.
     pub fn read_lines_or(&self, fallback: i64) -> i64 {
         match self.limits.read_lines {
             Some(lines) => lines.clamp(1, MAX_INJECTED_READ_LINES),
@@ -121,9 +97,7 @@ impl std::fmt::Display for ProtocolError {
 
 impl std::error::Error for ProtocolError {}
 
-/// Parses a request frame.  Values that are not strings are kept as their compact
-/// JSON text: an agent that ever starts sending `"timeout_sec":30` still gets a
-/// sandbox that understands it.
+/// Parses a request frame.  A value that is not a string is kept as its compact JSON text.
 pub fn parse_request(payload: &[u8]) -> Result<Request, ProtocolError> {
     let value: Value = serde_json::from_slice(payload).map_err(|_| ProtocolError::NotAnObject)?;
     let Value::Object(fields) = value else {
@@ -146,8 +120,7 @@ pub fn parse_request(payload: &[u8]) -> Result<Request, ProtocolError> {
                 Value::String(s) => s.clone(),
                 other => other.to_string(),
             };
-            // A repeated parameter keeps its first value, which is the one the
-            // agent's own argument lookup would have handed to a local tool.
+            // A repeated parameter keeps one value, as the agent's own lookup would.
             args.entry(key.clone()).or_insert(text);
         }
     }
@@ -160,9 +133,7 @@ pub fn parse_request(payload: &[u8]) -> Result<Request, ProtocolError> {
     })
 }
 
-/// A JSON value read as a whole number.  The agent sends limits as numbers, but
-/// every other value on this wire is a string, and a hand-written frame that mixes
-/// the two should still work.
+/// A whole number, from a number or from a string.
 fn as_whole(value: &Value) -> Option<i64> {
     match value {
         Value::Number(n) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)),
@@ -171,24 +142,21 @@ fn as_whole(value: &Value) -> Option<i64> {
     }
 }
 
-/// A successful answer.  `result` is already formatted for the model: the agent
-/// wraps it in the `Tool result N (name):` header verbatim.
+/// A successful answer.  `result` is already formatted for the model.
 pub fn response_ok(id: i64, result: &str) -> Vec<u8> {
     json!({ "id": id, "ok": true, "result": result })
         .to_string()
         .into_bytes()
 }
 
-/// A failed tool.  The message is the sentence after the agent's own
-/// "Tool error: " prefix, so it must read well standing there.
+/// A failed tool.  The message follows the agent's "Tool error: " prefix.
 pub fn response_error(id: i64, error: &str) -> Vec<u8> {
     json!({ "id": id, "ok": false, "error": error })
         .to_string()
         .into_bytes()
 }
 
-/// A notice: diagnostics for whoever reads `<trace>.sandbox.log`.  `id` 0 is never
-/// a request, and a notice never completes one, so this cannot answer early.
+/// A notice: diagnostics for `<trace>.sandbox.log`.  `id` 0 is never a request.
 pub fn notice(text: &str) -> Vec<u8> {
     json!({ "id": 0, "type": "log", "text": text })
         .to_string()
@@ -254,9 +222,7 @@ mod tests {
 
     #[test]
     fn a_duplicate_argument_still_yields_one_value() {
-        // JSON has nothing to say about a repeated key.  The agent's parser keeps
-        // the first and serde_json keeps the last; what matters is that a tool sees
-        // one value rather than having to guess which the model meant.
+        // Which of a repeated key wins is not specified; that a tool sees one does.
         let req =
             parse_request(br#"{"id":1,"tool":"x","args":{"k":"first","k":"second"}}"#).unwrap();
         assert!(matches!(req.arg("k"), Some("first") | Some("second")));
@@ -307,7 +273,6 @@ mod tests {
                 .read_lines_or(120),
             240
         );
-        // A sender that says nothing falls back to the helper's own setting.
         assert_eq!(
             parse(r#"{"id":1,"tool":"read","args":{}}"#).read_lines_or(120),
             120
@@ -322,8 +287,7 @@ mod tests {
                 .read_lines_or(120),
             crate::protocol::MAX_INJECTED_READ_LINES
         );
-        // Text is accepted because text is what the rest of the frame is made of,
-        // and nonsense is the same as absent rather than an error the model caused.
+        // Text is accepted, and nonsense counts as absent.
         assert_eq!(
             parse(r#"{"id":1,"tool":"read","limits":{"read_lines":"many"},"args":{}}"#)
                 .read_lines_or(120),
@@ -334,8 +298,7 @@ mod tests {
                 .read_lines_or(120),
             60
         );
-        // A cap this version does not know, and a limits object that is not one,
-        // are both ignored: a request is not rejected over a member it cannot read.
+        // An unknown cap, and a limits object that is not one, are both ignored.
         assert_eq!(
             parse(r#"{"id":1,"tool":"read","limits":{"max_bytes":10},"args":{}}"#)
                 .read_lines_or(120),
@@ -345,8 +308,6 @@ mod tests {
             parse(r#"{"id":1,"tool":"read","limits":"500","args":{}}"#).read_lines_or(120),
             120
         );
-        // A limit is not an argument, and does not arrive in the tool's own view of
-        // the call.
         assert_eq!(
             parse(r#"{"id":1,"tool":"read","limits":{"read_lines":240},"args":{}}"#).arg_or(
                 "max_lines",

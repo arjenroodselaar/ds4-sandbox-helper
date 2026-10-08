@@ -1,9 +1,6 @@
 //! `list`: one directory, in the order the filesystem gives it.
 //!
-//! Not sorted: the C agent prints `readdir()` order, and a model that has learned to
-//! recognise "the build products are the three newest entries" is relying on the
-//! order the directory actually has, not on an alphabetical reordering this tool
-//! would invent.
+//! Not sorted: the agent prints `readdir()` order, and the model reads that order.
 
 use std::fmt::Write;
 
@@ -27,8 +24,7 @@ pub async fn list(request: &Request) -> Result<String, String> {
     let mut more = false;
     loop {
         if shown >= MAX_ENTRIES {
-            // The cap counts entries we printed, so a skipped entry still means
-            // there was more to see.
+            // The cap counts printed entries, so a skipped one still means there was more.
             more = true;
             break;
         }
@@ -36,8 +32,7 @@ pub async fn list(request: &Request) -> Result<String, String> {
             break;
         };
         let name = entry.file_name().to_string_lossy().into_owned();
-        // lstat, not stat: a symlink is reported as a symlink, which is the only way
-        // a model sees that a name in the tree is a pointer somewhere else.
+        // lstat, not stat, so a symlink reads as a pointer.
         let full = entry.path();
         let Ok(meta) = tokio::fs::symlink_metadata(&full).await else {
             continue;
@@ -53,8 +48,7 @@ pub async fn list(request: &Request) -> Result<String, String> {
             '?'
         };
         let suffix = if file_type.is_dir() { "/" } else { "" };
-        // The width matches `%10lld`: sizes line up, which is what makes a scanned
-        // listing readable.
+        // The width matches `%10lld`, so sizes line up.
         let _ = writeln!(out, "{kind} {:>10} {name}{suffix}", meta.len());
         shown += 1;
     }
@@ -94,7 +88,6 @@ mod tests {
             .find(|l| l.ends_with("file.txt"))
             .unwrap_or_default();
         assert!(file.starts_with("- "), "{file}");
-        // The size column is `%10lld` wide, which is what lines a scanned listing up.
         assert_eq!(file, "-          5 file.txt");
         let link = text
             .lines()

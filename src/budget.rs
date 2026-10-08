@@ -1,17 +1,13 @@
 //! The byte budget every tool output shares.
 //!
-//! A tool answer goes straight into the model's context, so an over-long answer is
-//! not merely untidy: it pushes the conversation out of the window.  The C agent
-//! solves this with a growing buffer that stops at 128 KiB on a character
-//! boundary and says so, and the sandbox keeps the same rule so that a sandbox
-//! cannot put a bigger observation in front of the model than the agent would have
-//! written itself.
+//! An over-long answer pushes the conversation out of the model's window, so the
+//! sandbox keeps the agent's rule: stop at 128 KiB on a character boundary and say
+//! so.
 
 use std::fmt;
 use std::fmt::Write;
 
-/// The agent truncates sandbox answers at the same size; going over it only buys a
-/// second truncation with a different note.
+/// The same limit the agent applies to a sandbox answer.
 pub const MAX_TOOL_BYTES: usize = 128 * 1024;
 
 /// Room kept free for the note, so the finished text still fits the limit.
@@ -19,9 +15,7 @@ pub const NOTE_MARGIN: usize = 4096;
 
 const NOTE: &str = "\n[Output truncated at the tool byte limit. Narrow the request.]\n";
 
-/// A `String` that stops growing on its own.  Implements [`fmt::Write`], so tool
-/// code reads like ordinary `write!` formatting and the truncation is invisible
-/// until the text is finished.
+/// A `String` that stops growing at its limit, through [`fmt::Write`].
 pub struct Budget {
     text: String,
     limit: usize,
@@ -37,8 +31,7 @@ impl Budget {
         }
     }
 
-    /// A budget whose limit leaves room for the note itself, which is what a tool
-    /// that may truncate wants.
+    /// A limit that leaves room for the note itself.
     pub fn for_output() -> Self {
         Self::new(MAX_TOOL_BYTES.saturating_sub(NOTE_MARGIN))
     }
@@ -47,9 +40,7 @@ impl Budget {
         self.truncated
     }
 
-    /// The text so far, without the note.  `read` uses this because its own
-    /// truncation note carries resume coordinates and a second note would only
-    /// contradict it.
+    /// The text so far, without the note: `read` adds its own with resume coordinates.
     pub fn text(&self) -> &str {
         &self.text
     }
@@ -75,8 +66,7 @@ impl Write for Budget {
             self.text.push_str(s);
             return Ok(());
         }
-        // Cut on a character boundary: half a multi-byte character in the model's
-        // context is worse than the text that was left out.
+        // Half a multi-byte character is worse than the text left out.
         let mut cut = room;
         while cut > 0 && !s.is_char_boundary(cut) {
             cut -= 1;

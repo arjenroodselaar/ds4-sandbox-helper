@@ -1,10 +1,9 @@
 //! File access shared by the read, write, edit, search and list tools.
 //!
-//! Two rules from the C agent carry over because both are about not destroying
-//! something the user did not ask to destroy: a file that is replaced is replaced
-//! atomically through a temporary in the same directory, and a file that is not a
-//! plain exclusive file is refused instead of followed.  A symlink in the way of a
-//! write is therefore an error rather than a surprise somewhere else on disk.
+//! Two rules from the C agent carry over, both about not destroying something the
+//! user did not ask to destroy: a replaced file is replaced atomically through a
+//! temporary in the same directory, and anything that is not a plain exclusive file is
+//! refused rather than followed.
 
 use std::fs::File;
 use std::fs::Metadata;
@@ -22,24 +21,16 @@ use std::path::Path;
 
 use tempfile::NamedTempFile;
 
-/// Largest file a tool will hold in memory.  `edit` needs the whole file to prove
-/// that its `old` selector is unique, and an unbounded read here would turn a
-/// mistaken path into an out-of-memory crash.
+/// Largest file a tool will hold in memory: `edit` needs the whole file to prove that
+/// its `old` selector is unique, and an unbounded read turns a wrong path into a crash.
 pub const MAX_FILE_BYTES: usize = 16 * 1024 * 1024;
 
-/// Everything here that is not a plain read or write goes through
-/// [`tokio::task::spawn_blocking`], for two reasons that are the same reason.
-/// Tokio has no equivalent for the flags these opens need (`O_NOFOLLOW` on the
-/// target, `O_NONBLOCK` so a fifo cannot hang us), nor for the exclusive create of
-/// the temporary or the ownership and extended-attribute calls that follow.
-/// And the sequence that replaces a file is a *unit*: checking what is there,
-/// writing a temporary next to it and renaming over the original is only safe if
-/// nothing else interleaves, so it runs as one piece of work on the blocking pool
-/// rather than as a chain of awaits that another request could slip between.
-///
-/// The functions the tools call are therefore `async` wrappers around blocking
-/// bodies, and the byte counts are the same either way: what they protect against
-/// is a tool that never returns, not a tool that takes a worker thread for a while.
+/// Everything that is not a plain read or write runs on the blocking pool.  Tokio has
+/// no equivalent for the flags these opens need (`O_NOFOLLOW` on the target,
+/// `O_NONBLOCK` so a fifo cannot hang us), the exclusive create, or the ownership and
+/// extended-attribute calls.  And replacing a file is a *unit* — check what is there,
+/// write a temporary next to it, rename over the original — which is only safe if no
+/// other request interleaves with it.
 async fn blocking_io<T>(f: impl FnOnce() -> io::Result<T> + Send + 'static) -> io::Result<T>
 where
     T: Send + 'static,
@@ -60,9 +51,8 @@ where
         .unwrap_or_else(|err| Err(did_not_finish(&err)))
 }
 
-/// The only way a blocking body fails this way is a panic inside it or a runtime
-/// torn down mid-write.  Both are worth reporting as a failed tool rather than
-/// taking the process with them: the frame stream is still usable.
+/// A panic inside a blocking body, or a runtime torn down mid-write: a failed tool
+/// rather than a dead process, since the frame stream still works.
 fn did_not_finish(err: &tokio::task::JoinError) -> String {
     format!("file operation did not finish: {err}")
 }
@@ -87,8 +77,7 @@ fn open_regular_blocking(path: &str) -> io::Result<File> {
     Ok(file)
 }
 
-/// Reads a whole file with the C agent's error wording, which is what the model is
-/// used to seeing for a path it got wrong.
+/// Reads a whole file, with the error wording the model is used to seeing.
 pub async fn read_bytes(path: &str) -> Result<Vec<u8>, String> {
     let path = path.to_string();
     blocking_text(move || read_bytes_blocking(&path)).await
@@ -120,8 +109,7 @@ fn read_bytes_blocking(path: &str) -> Result<Vec<u8>, String> {
     Ok(data)
 }
 
-/// The message a `strerror()` would have given: the C agent reports `No such file
-/// or directory`, and the model has learned that phrasing.
+/// The wording `strerror()` would have given, which is what the model has learned.
 pub fn err_message(err: &io::Error) -> String {
     match err.raw_os_error() {
         Some(code) => errno_message(code),
@@ -159,9 +147,8 @@ fn replace_blocking(path: &str, data: &[u8], expected: Option<&[u8]>) -> Result<
         Err(err) => return Err(err_message(&err)),
     };
 
-    // Nothing to clean up here: the temporary a replacement is written into deletes
-    // itself when it is dropped, which is every path that did not get as far as the
-    // rename.
+    // Nothing to clean up: the temporary deletes itself on every path that did not
+    // reach the rename.
     replace_inner(target, existing.as_ref(), data, expected)
 }
 
@@ -172,8 +159,7 @@ fn replace_inner(
     expected: Option<&[u8]>,
 ) -> Result<(), String> {
     if existing.is_some() {
-        // Resolve the name so the temporary lands next to the file, then refuse
-        // anything we cannot replace in place safely.
+        // Resolve the name so the temporary lands next to the file.
         let resolved = std::fs::canonicalize(target).map_err(|err| err_message(&err))?;
         let source = OpenOptions::new()
             .read(true)
@@ -195,33 +181,26 @@ fn replace_inner(
             return Err(changed(target));
         }
         let temp = copy_metadata(&source, data, &resolved, mode)?;
-        // The last look before committing, taken exactly where the C agent takes it.
-        // Everything between reading the file and this moment is the window a
-        // concurrent writer can slip into, and matching bytes are not enough to shut
-        // it: a writer that replaced the file with identical content moved a
-        // different inode into the name, and the edit would then have replaced a
-        // file that nobody had read.
+        // The last look before committing.  Matching bytes are not enough: a writer
+        // that replaced the file with identical content moved a different inode into
+        // the name, and this edit would replace a file nobody had read.
         if !still_the_same(target, &resolved, &source_meta) {
             return Err(changed(target));
         }
-        // Renamed onto the resolved name rather than the one we were given: the
-        // target file is replaced in place and a symlink pointing at it goes on
-        // pointing at it, where renaming over the name would turn the link into a
-        // ordinary file and orphan whatever it referred to.
+        // Renamed onto the resolved name so the file is replaced in place and a symlink
+        // to it keeps pointing at it, instead of becoming an ordinary file.
         return rename(temp, &resolved);
     }
 
     if expected.is_some() {
-        // The edit read a file that is no longer there; that is the same race as a
-        // changed file and gets the same answer.
+        // The file the edit read is gone: the same race, the same answer.
         return Err(changed(target));
     }
     link_new(create_new(target, data)?, target)
 }
 
-/// What the agent says when the file is not the one the edit was worked out against.
-/// The wording is the agent's own, because it is what models have been tuned against,
-/// and it tells the model the one useful next step: read again.
+/// What the agent says when the file is not the one the edit was worked out against:
+/// the agent's own wording, whose useful next step is to read the file again.
 fn changed(target: &Path) -> String {
     format!(
         "file changed while editing; read it again: {}",
@@ -272,9 +251,8 @@ fn still_the_same(target: &Path, resolved: &Path, before: &Metadata) -> bool {
 }
 
 /// True when `path` still describes `before`: the same inode on the same device, with
-/// the same size, link count and timestamps to the nanosecond.  A byte compare cannot
-/// tell any of this — a rewrite that produced the same bytes leaves the name pointing
-/// at a different inode, and `ctime` moves even when `mtime` is put back by hand.
+/// the same size, link count and timestamps.  A byte compare cannot see this — a
+/// rewrite with identical bytes leaves a different inode behind the name.
 fn same_file_version(before: &Metadata, path: &Path) -> bool {
     let Ok(after) = std::fs::metadata(path) else {
         return false;
@@ -289,17 +267,11 @@ fn same_file_version(before: &Metadata, path: &Path) -> bool {
         && before.ctime_nsec() == after.ctime_nsec()
 }
 
-/// The temporary a replacement is written into, next to the target and named the way
-/// the C agent names its own — `<name>.ds4-XXXXXX` — so that a leftover from either
-/// program reads the same to whoever finds it.  `tempfile` supplies the random tail,
-/// creates the file exclusively, and deletes it if it is dropped before the rename;
-/// the mode goes to `open`, so a brand new file still has the umask applied to it
-/// while a replaced one is born with the target's own bits.
-///
-/// The builder is what makes that mode part of the create; the shorter
-/// `NamedTempFile::with_prefix_in` cannot say it, and setting the permissions
-/// afterwards would go through `chmod`, which ignores the umask and would leave a
-/// brand new file world-writable.
+/// The temporary a replacement is written into, next to the target and named
+/// `<name>.ds4-XXXXXX` so a leftover from either program reads the same.  `tempfile`
+/// supplies the tail, creates the file exclusively, and deletes it if it is dropped
+/// before the rename.  The mode goes to `open` rather than to a later `chmod`, which
+/// would ignore the umask and leave a new file world-writable.
 fn temp_for(target: &Path, mode: u32) -> Result<NamedTempFile, String> {
     let dir = match target.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
@@ -328,9 +300,8 @@ fn create_new(target: &Path, data: &[u8]) -> Result<NamedTempFile, String> {
     write_temp(target, data, 0o666)
 }
 
-/// Replaces an existing file, keeping its owner and permissions.  The temporary is
-/// created with the target's mode so an executable or a 0600 file stays what it is
-/// across an edit.
+/// Replaces an existing file keeping its owner and permissions: the temporary is
+/// created with the target's mode, so an executable stays one.
 fn copy_metadata(
     source: &File,
     data: &[u8],
@@ -342,17 +313,13 @@ fn copy_metadata(
     let owner = source.metadata().ok();
     let uid = owner.as_ref().map(MetadataExt::uid).unwrap_or(u32::MAX);
     let gid = owner.as_ref().map(MetadataExt::gid).unwrap_or(u32::MAX);
-    // Ownership can only be given away by root; failing that is not a reason to
-    // lose the edit, since the file is still the right bytes and mode.
+    // Only root can hand ownership over; losing it is not worth losing the edit.
     unsafe { libc::fchown(temp.as_raw_fd(), uid as libc::uid_t, gid as libc::gid_t) };
 
     #[cfg(target_os = "macos")]
     {
-        // Carry the ACL and extended attributes the same way the C agent does.
-        // Unlike the C version this is best effort: losing an xattr is worth
-        // reporting, not worth losing the edit over.  Both descriptors are already
-        // open in the direction this needs: the target for reading, the temporary
-        // for writing.
+        // Carry the ACL and extended attributes, best effort: losing one is worth
+        // reporting, not worth losing the edit over.
         unsafe {
             libc::fcopyfile(
                 source.as_raw_fd(),
@@ -364,22 +331,17 @@ fn copy_metadata(
     }
     #[cfg(target_os = "linux")]
     {
-        // Linux has no single call that copies "the rest" of a file's metadata, but
-        // it keeps both the extended attributes and the POSIX ACL in one place: the
-        // ACL is `system.posix_acl_access`, an attribute like any other.  So the
-        // attributes are carried over, and the ACL travels with them.  The same
-        // bargain as the macOS branch: an attribute the kernel will not let this
-        // process write — `security.selinux` and `trusted.*` are the usual ones — is
-        // skipped rather than costing the edit.
+        // Linux keeps the POSIX ACL as `system.posix_acl_access`, one attribute among
+        // the rest, so carrying the attributes carries it.  An attribute the kernel
+        // will not let this process write (`security.selinux`, `trusted.*`) is skipped
+        // rather than costing the edit.
         copy_xattrs(source.as_raw_fd(), temp.as_raw_fd());
     }
     Ok(temp)
 }
 
-/// Carries every extended attribute from one open file to another, forgetting the
-/// ones this process has no business setting.  Best effort by design: the bytes and
-/// the mode are the contract, and an ACL that could not be reproduced is worth
-/// reporting to whoever looks, not worth losing the write over.
+/// Carries every extended attribute from one open file to another, skipping the ones
+/// this process has no business setting: bytes and mode are the contract.
 #[cfg(target_os = "linux")]
 fn copy_xattrs(from: std::os::fd::RawFd, to: std::os::fd::RawFd) {
     for name in xattr_names(from) {
@@ -437,15 +399,12 @@ fn rename(temp: NamedTempFile, target: &Path) -> Result<(), String> {
 }
 
 /// The last step for a file that was not there: `link`, not `rename`.  A link will not
-/// overwrite a name that appeared while the temporary was being written, so the writer
-/// that got there first keeps its file and this one comes back with `File exists`.  A
-/// rename would have quietly won a race nobody was watching, which is the one answer
-/// the model cannot recover from.
+/// overwrite a name that appeared while the temporary was being written, so the first
+/// writer keeps its file and this one comes back with `File exists`; a rename would
+/// have quietly won a race nobody was watching.
 ///
-/// Filesystems that cannot link at all — a FAT card, one FUSE mount out of several —
-/// still have to be able to create a file, so the link is retried as a rename when the
-/// refusal is about the link rather than about the file.  On such a filesystem the race
-/// protection was never available; everywhere it is, it is used.
+/// Where linking is unsupported — a FAT card, one FUSE mount out of several — the link
+/// is retried as a rename, because the race protection was never available there.
 fn link_new(temp: NamedTempFile, target: &Path) -> Result<(), String> {
     if let Err(err) = std::fs::hard_link(temp.path(), target) {
         if !link_was_unsupported(&err) {
@@ -453,8 +412,7 @@ fn link_new(temp: NamedTempFile, target: &Path) -> Result<(), String> {
         }
         return rename(temp, target);
     }
-    // Closing the handle is also the unlink of the temporary's own name: the target
-    // keeps the inode, and nothing is left behind either way.
+    // Closing also unlinks the temporary's own name: the target keeps the inode.
     temp.close().map_err(|err| failed(target, &err))
 }
 
@@ -464,10 +422,9 @@ fn link_new(temp: NamedTempFile, target: &Path) -> Result<(), String> {
 const LINK_UNSUPPORTED: &[i32] = &[libc::EPERM, libc::ENOTSUP, libc::EOPNOTSUPP, libc::ENOSYS];
 
 fn link_was_unsupported(err: &io::Error) -> bool {
-    // `EEXIST` is the one code that must stay an error: it is the race this link
-    // exists to lose, and falling back on it would hand the race straight back.
-    // `EXDEV` is absent for a different reason — the temporary is made next to its
-    // target, so a rename could not cross the device either.
+    // `EEXIST` must stay an error: falling back on it would hand back the race this
+    // link exists to lose.  `EXDEV` is absent because the temporary is made next to
+    // its target, so a rename could not cross the device either.
     err.raw_os_error()
         .is_some_and(|code| LINK_UNSUPPORTED.contains(&code))
 }
@@ -521,9 +478,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
-    /// A file path inside a fresh directory that deletes itself with the test.  The
-    /// caller keeps the directory by holding the second half of the pair, which is
-    /// what the underscore in front of its name means.
+    /// A file path in a self-deleting directory; the caller keeps the directory.
     fn temp_path(tag: &str) -> (PathBuf, tempfile::TempDir) {
         let dir = tempfile::TempDir::with_prefix(format!("ds4-helper-{tag}-")).unwrap();
         (dir.path().join("file"), dir)
@@ -548,9 +503,8 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .into_owned();
-        // `file.ds4-XXXXXX`, in the target's own directory: the shape the C agent's
-        // mkstemp leaves behind, and the reason the last step is a rename rather
-        // than a copy that could cross onto another filesystem.
+        // `file.ds4-XXXXXX` in the target's own directory, which is why the last step
+        // is a rename rather than a copy that could cross onto another filesystem.
         let tail = name.strip_prefix("file.ds4-").unwrap_or_default();
         assert_eq!(tail.len(), 6, "temporary named {name}");
         assert_eq!(temp.path().parent().unwrap(), path.parent().unwrap());
@@ -558,8 +512,8 @@ mod tests {
             temp.as_file().metadata().unwrap().permissions().mode() & 0o777,
             0o600
         );
-        // And it is the handle that owns it: nothing is left to rot next to a file
-        // whose replacement failed halfway.
+        // And the handle owns it, so nothing is left next to a file whose replacement
+        // failed halfway.
         let left = temp.path().to_path_buf();
         drop(temp);
         assert!(!left.exists(), "the temporary outlived its handle");
@@ -588,8 +542,8 @@ mod tests {
             )
         };
         if set != 0 {
-            // Not every filesystem accepts user attributes — tmpfs only learned it
-            // recently — and one that will not hold one is not a verdict on this code.
+            // Not every filesystem accepts user attributes, and one that will not hold
+            // one is not a verdict on this code.
             return;
         }
 
@@ -611,8 +565,8 @@ mod tests {
         replace(text, b"hello".to_vec(), None).await.unwrap();
         assert_eq!(std::fs::read(text).unwrap(), b"hello");
         let parent = path.parent().unwrap();
-        // Only this file's temporaries: other tests are replacing their own files
-        // in the same directory at the same moment.
+        // Only this file's temporaries: other tests replace their own files here at the
+        // same moment.
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
         let leftovers: Vec<_> = std::fs::read_dir(parent)
             .unwrap()
@@ -647,8 +601,8 @@ mod tests {
         std::fs::remove_file(text).unwrap();
     }
 
-    /// The wording is part of the interface: a model tuned against it knows the next
-    /// step is to read the file again, not to try the same edit a second time.
+    /// The wording is part of the interface: it tells the model to read again rather
+    /// than repeat the edit.
     #[tokio::test]
     async fn a_lost_race_is_answered_in_the_agents_words() {
         let (path, _dir) = temp_path("wording");
@@ -661,8 +615,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(err, expected, "a file whose bytes moved");
 
-        // The same answer when the file is gone: an edit that read a file which is no
-        // longer there is the same race wearing a different hat.
+        // A file that is gone is the same race, and gets the same answer.
         std::fs::remove_file(text).unwrap();
         let err = replace(text, b"edited".to_vec(), Some(b"original\n".to_vec()))
             .await
@@ -670,9 +623,8 @@ mod tests {
         assert_eq!(err, expected, "a file that vanished");
     }
 
-    /// The look taken just before the rename, checked without needing to win a race.
-    /// A name that moved, an inode that moved, and a file that went away are three
-    /// different ways an edit can be about something that is no longer there.
+    /// The look taken just before the rename, checked without winning a race: a name
+    /// that moved, an inode that moved, and a file that went away.
     #[test]
     fn the_guard_notices_a_name_that_no_longer_means_the_same_file() {
         let scratch = tempfile::TempDir::with_prefix("ds4-helper-version-").unwrap();
@@ -696,8 +648,8 @@ mod tests {
             "another inode under the same name"
         );
 
-        // A name that resolves somewhere else is not the file that was read, even to
-        // a file with the same bytes in it.
+        // A name resolving somewhere else is not the file that was read, however equal
+        // its bytes.
         let elsewhere = dir.join("elsewhere");
         std::fs::write(&elsewhere, b"bytes\n").unwrap();
         let link = dir.join("link");
@@ -725,8 +677,8 @@ mod tests {
     fn a_file_created_underneath_a_write_is_not_overwritten() {
         let (path, _dir) = temp_path("link");
         let text = path.to_str().unwrap();
-        // Not through `replace`: the point is to hold a finished temporary while
-        // something else creates the name it was written for.
+        // Not through `replace`: the temporary is held while another writer creates
+        // the name it was written for.
         let temp = create_new(&path, b"the helper wrote this\n").unwrap();
         std::fs::write(text, b"someone else got here first\n").unwrap();
 
@@ -746,8 +698,8 @@ mod tests {
 
     /// Retrying a failed link is for a filesystem that cannot link, never for the race
     /// the link was put there to lose: falling back on `EEXIST` would hand it straight
-    /// back.  Which half of this the branch is cannot be tried on a filesystem that
-    /// links happily, so the decision itself is what is checked here.
+    /// back.  A filesystem that links happily cannot show either half, so the decision
+    /// itself is what is checked here.
     #[test]
     fn only_a_link_the_filesystem_cannot_do_falls_back_to_the_rename() {
         let refused = |code| io::Error::from_raw_os_error(code);
@@ -756,8 +708,7 @@ mod tests {
         assert!(link_was_unsupported(&refused(libc::EOPNOTSUPP)));
         assert!(link_was_unsupported(&refused(libc::ENOSYS)));
 
-        // The race, and the failures that are about the file or the disk rather than
-        // about the operation.
+        // The race, and failures about the file or disk rather than the operation.
         assert!(!link_was_unsupported(&refused(libc::EEXIST)), "the race");
         assert!(!link_was_unsupported(&refused(libc::ENOENT)));
         assert!(!link_was_unsupported(&refused(libc::ENOSPC)));
@@ -807,10 +758,8 @@ mod tests {
         let link = dir.path().join("link");
         std::fs::write(&target, b"victim").unwrap();
         std::os::unix::fs::symlink(&target, &link).unwrap();
-        // The agent resolves the path first and then opens it without following, so
-        // a name that is a symlink reaches its target while a symlink swapped in
-        // afterwards is refused.  The name is not a separate file, and replacing it
-        // as one would leave the target unreachable.
+        // The path is resolved first and then opened without following: a name that is
+        // a symlink reaches its target, a symlink swapped in afterwards is refused.
         replace(link.to_str().unwrap(), b"replacement".to_vec(), None)
             .await
             .unwrap();

@@ -1,16 +1,12 @@
 //! `edit`: replace one uniquely-anchored span of a file.
 //!
-//! Three properties make this tool safe to hand to a language model, and all three
-//! come from the C agent.  The `old` selector must match exactly once, because a
-//! model that meant one occurrence and hit two has described an edit that does not
-//! exist.  The write goes through the same atomic replace as `write`, so a crash
-//! cannot leave a half-written file.  And the file is checked against the bytes that
-//! were searched, so an edit computed against a stale read is refused rather than
-//! quietly applied on top of someone else's change.
+//! Three properties, all inherited from the C agent: `old` must match exactly once;
+//! the write goes through the same atomic replace as `write`; and the file is checked
+//! against the bytes that were searched, so an edit computed from a stale read is
+//! refused rather than applied over someone else's change.
 //!
-//! The result text is not decoration.  Reporting which old lines were touched, and
-//! how much the lines after them shifted, is what lets the model keep using line
-//! numbers it already has instead of re-reading the file to find out where it is.
+//! The result text lets the model keep using line numbers it already has: which lines
+//! were touched, and how far the lines after them shifted.
 
 use std::fmt::Write;
 
@@ -49,9 +45,7 @@ pub async fn edit(request: &Request, allow_upto: bool) -> Result<String, String>
     replacement.extend_from_slice(new.as_bytes());
     replacement.extend_from_slice(&data[offset + removed..]);
 
-    // The report is assembled before anything is written, because the answer
-    // describes the file as it will be and the new bytes are moved into the write
-    // below.  A failed replace returns an error and this text is dropped with it.
+    // The report describes the file as it will be, so it is assembled before the write.
     let old_spans = files::line_spans(&data);
     let new_spans = files::line_spans(&replacement);
     let kind = if anchored {
@@ -95,9 +89,8 @@ pub async fn edit(request: &Request, allow_upto: bool) -> Result<String, String>
         );
     }
 
-    // The guard is the bytes the anchor was searched in: if the file moved, the
-    // offset this edit computed points somewhere else, and "somewhere else" is the
-    // part that would corrupt a file.
+    // The guard is the bytes the anchor was searched in: if the file moved, this
+    // offset points somewhere else.
     files::replace(path, replacement, Some(data)).await?;
     Ok(out.into_string())
 }
@@ -118,8 +111,8 @@ fn find_old_span(
         return Err("old text contains more than one [upto] marker".into());
     }
     let mut tail = &old[head_len + UPTO_MARKER.len()..];
-    // The head already ends with the newline the file has after it, so a newline
-    // written straight after the marker is not part of the file's text.
+    // The head already ends with the file's newline, so one written after the marker
+    // is not part of the file.
     while first_is(tail, b'\n') || first_is(tail, b'\r') {
         tail = &tail[1..];
     }
@@ -132,8 +125,8 @@ fn find_old_span(
     Ok((head_pos, tail_pos + tail.len() - head_pos, true))
 }
 
-/// The C agent requires a tail anchor that occurs once after the head, which is what
-/// makes an `[upto]` edit as safe as a whole-span match.
+/// An `[upto]` edit needs its tail anchor to occur once after the head, which is what
+/// makes it as safe as a whole-span match.
 fn find_unique(data: &[u8], needle: &[u8], label: &str) -> Result<usize, String> {
     if needle.is_empty() {
         return Err(format!("{label} anchor is empty"));
@@ -433,8 +426,7 @@ mod tests {
                 r#""path":"{path}","old":"{}","new":"{}""#,
                 escape("50\n51\n52\n"),
                 escape(
-                    // More than EDITED_CONTEXT_HEAD + EDITED_CONTEXT_TAIL lines,
-                    // so the middle of the edited span has to be left out.
+                    // More lines than the edited-context limits, so the middle is left out.
                     &(60..130).map(|n| format!("new {n}\n")).collect::<String>()
                 )
             )),

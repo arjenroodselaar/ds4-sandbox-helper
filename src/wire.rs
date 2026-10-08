@@ -4,12 +4,9 @@
 //! <decimal byte count>\n<exactly that many bytes of JSON>
 //! ```
 //!
-//! The length is counted rather than delimited, so a payload may contain any byte
-//! a JSON string can carry, newlines included.  The price is that a lost or extra
-//! byte is unrecoverable: there is no marker to resynchronise on, and guessing
-//! where the next frame starts would mean inventing tool results.  That is why
-//! most failures here are fatal for the session and only the size ceilings are
-//! not: a frame that is merely too big can still be counted out of the stream.
+//! A counted length lets a payload carry any byte a JSON string can.  The price is
+//! that a lost or extra byte cannot be resynchronised on, so most failures here end
+//! the session; an oversized frame is the exception, since it can be counted out.
 
 use std::fmt;
 use std::io;
@@ -21,24 +18,20 @@ use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 
-/// Longest accepted header, newline included.  A longer run of digits is not a
-/// frame; it is a program printing something other than frames.
+/// Longest accepted header, newline included.
 pub const MAX_HEADER_BYTES: usize = 32;
-/// Largest request the agent will send, and largest response we will send.
-/// Oversized answers are dropped rather than truncating a session.
+/// Largest request accepted, and largest response sent.
 pub const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 
-/// One frame's worth of bytes, or the fact that a frame was too large and was
-/// counted out of the stream instead.
+/// One frame's bytes, or the fact that it was too large and was counted out.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
     Payload(Vec<u8>),
     Skipped { declared: usize },
 }
 
-/// Why the stream can no longer be read as frames.  Every variant ends the
-/// session: the peer is not speaking the protocol, or is gone.
+/// Why the stream can no longer be read as frames.  Every variant ends the session.
 #[derive(Debug)]
 pub enum WireError {
     /// End of stream where a header had already begun: a truncated frame.
@@ -87,13 +80,10 @@ impl From<io::Error> for WireError {
     }
 }
 
-/// Reads the next frame, or `None` when the peer closed the stream cleanly at a
-/// frame boundary.
+/// Reads the next frame, or `None` when the peer closed the stream at a frame boundary.
 ///
-/// A payload larger than `max_payload` is read and discarded and reported as
-/// [`Frame::Skipped`], which keeps the stream aligned: the only thing wrong with
-/// that frame was its size, and the request that provoked it can still be answered
-/// with an error.
+/// A payload over `max_payload` is counted out and reported as [`Frame::Skipped`],
+/// which keeps the stream aligned.
 pub async fn read_frame<R>(reader: &mut R, max_payload: usize) -> Result<Option<Frame>, WireError>
 where
     R: AsyncRead + AsyncBufRead + Unpin,
@@ -101,7 +91,6 @@ where
     let mut header = Vec::new();
     let read = reader.read_until(b'\n', &mut header).await?;
     if read == 0 {
-        // Nothing at all: the agent closed stdin, which is how a session ends.
         return Ok(None);
     }
     if !header.ends_with(b"\n") {
@@ -133,10 +122,8 @@ where
     Ok(Some(Frame::Payload(payload)))
 }
 
-/// The digits before the newline, or `None` when they are not a positive decimal
-/// count.  Leading zeros are accepted; an empty or signed or non-digit header is
-/// not a frame.  The value is `usize`-sized on purpose: a count too large for
-/// `usize` cannot be a frame either.
+/// The digits before the newline.  Leading zeros are accepted; an empty, signed or
+/// non-digit header is not a count, nor is one too large for `usize`.
 fn parse_header(bytes: &[u8]) -> Option<usize> {
     if bytes.is_empty() || bytes.len() > 20 {
         return None;
@@ -151,8 +138,7 @@ fn parse_header(bytes: &[u8]) -> Option<usize> {
     }
 }
 
-/// Writes one frame.  The caller owns the ceilings: a payload over the response
-/// limit is an error to report, not something to squeeze into the stream.
+/// Writes one frame.  The caller owns the ceilings.
 pub async fn write_frame<W>(writer: &mut W, payload: &[u8]) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -160,8 +146,7 @@ where
     let header = format!("{}\n", payload.len());
     writer.write_all(header.as_bytes()).await?;
     writer.write_all(payload).await?;
-    // The agent waits on this pipe; a buffered frame it cannot see looks exactly
-    // like a sandbox that stopped thinking.
+    // The agent waits on this pipe; a buffered frame looks like a stuck sandbox.
     writer.flush().await
 }
 

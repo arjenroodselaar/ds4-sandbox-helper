@@ -1,18 +1,14 @@
 //! `bash`, `bash_status` and `bash_stop`: shell commands that outlive one request.
 //!
-//! The shape of this tool is dictated by one fact: a command that takes four
-//! minutes must not make the model wait four minutes to learn that it started.  So
-//! the command runs in its own process group with its output spooled to a file, and
-//! every answer has the same shape whether the command has finished or not.  The
-//! first answer shows the head of the output, later ones show the tail, and the file
-//! stays on disk so `read` can be pointed at the part that matters.
+//! A command that takes four minutes must not make the model wait four minutes to
+//! learn that it started.  So the command runs in its own process group with its
+//! output spooled to a file, and every answer has the same shape: the first shows the
+//! head of the output, later ones the tail, and `read` can be pointed at the file.
 //!
-//! The C agent polls its jobs from a monitor thread.  Here each job gets a task that
-//! awaits its child and enforces the deadline, and a waiter subscribes to a watch
-//! channel instead of sleeping in a loop: a finished job wakes whoever is waiting for
-//! it instead of being noticed up to a refresh interval later.  Output goes straight
-//! to the spool file rather than through a pipe, which is one fewer thing that can
-//! fill a buffer and stall the command.
+//! Each job gets a task that awaits its child and enforces the deadline, and a waiter
+//! subscribes to a watch channel instead of polling, so a finished job wakes whoever
+//! is waiting for it.  Output goes straight to the spool file rather than through a
+//! pipe, which is one fewer buffer that can fill and stall the command.
 
 use std::fmt::Write;
 use std::io::SeekFrom;
@@ -48,8 +44,7 @@ const STOP_GRACE: Duration = Duration::from_secs(1);
 /// It is a ceiling, not a delay: the answer goes out the moment the job is reaped.
 const STOP_WAIT: Duration = Duration::from_secs(5);
 
-/// What the watcher task knows about a job.  Cloned into every observation, so
-/// reading a snapshot cannot race with the child exiting underneath it.
+/// What the watcher task knows about a job, cloned into every observation.
 #[derive(Debug, Clone)]
 pub struct Status {
     pub running: bool,
@@ -57,8 +52,7 @@ pub struct Status {
     pub timed_out: bool,
     /// Output the spool file could not hold.  Reported, never quietly dropped.
     pub output_error: Option<String>,
-    /// When the child exited: elapsed time has to stop there, not keep growing for
-    /// whoever asks about the job an hour later.
+    /// When the child exited, so elapsed time stops there.
     pub ended_at: Option<Instant>,
 }
 
@@ -99,8 +93,7 @@ impl Job {
     }
 }
 
-/// The table of jobs the agent may ask about.  Owned by the sandbox session, so
-/// `bash_status` finds the job `bash` started.
+/// The jobs the agent may ask about, owned by the session.
 #[derive(Default)]
 pub struct Jobs {
     pub next_id: i32,
@@ -108,9 +101,8 @@ pub struct Jobs {
 }
 
 impl Jobs {
-    /// By id, falling back to pid only when no id was given: a model that remembers
-    /// a pid but not a job number is still pointing at a specific process, and a pid
-    /// is not a stable handle once the job has been reaped.
+    /// By id, falling back to pid only when no id was given: a pid is not a stable
+    /// handle once the job has been reaped.
     fn find_index(&self, id: i32, pid: i64) -> Option<usize> {
         self.list.iter().position(|job| {
             (id > 0 && job.id == id) || (id <= 0 && pid > 0 && job.pid as i64 == pid)
@@ -118,8 +110,8 @@ impl Jobs {
     }
 
     async fn remove(&mut self, id: i32) {
-        // A finished job's spool file is deleted with the job: the agent has already
-        // been shown the output, and /tmp is not this process's to keep.
+        // A finished job's spool file goes with it: the agent has already seen the
+        // output, and /tmp is not this process's to keep.
         if let Some(index) = self.list.iter().position(|job| job.id == id) {
             let job = self.list.remove(index);
             let _ = tokio::fs::remove_file(&job.path).await;
@@ -127,11 +119,9 @@ impl Jobs {
     }
 }
 
-/// Starts a command and reports the first snapshot, waiting at most `refresh_sec`
-/// for a command that finishes quickly.  The shell used to execute it is the one
-/// settled on when the helper started, not something the request can ask for: whoever
-/// started the helper knows what the sandbox has installed, and a model that could
-/// name an interpreter would eventually name one that is not there.
+/// Starts a command and reports the first snapshot, waiting at most `refresh_sec` for
+/// a command that finishes quickly.  The shell is the one settled on at startup: a
+/// model that could name an interpreter would eventually name one that is not there.
 pub async fn start(request: &Request, jobs: &mut Jobs, shell: &Path) -> Result<String, String> {
     let Some(command) = request.arg("command").filter(|c| !c.is_empty()) else {
         return Err("bash requires command".into());
@@ -160,26 +150,21 @@ pub async fn start(request: &Request, jobs: &mut Jobs, shell: &Path) -> Result<S
         .map_err(|err| format!("bash failed to start: {err}"))?;
 
     let mut child = Command::new(shell)
-        // `-c` is the one flag every shell worth choosing understands: bash, zsh,
-        // dash and ksh all take the command there.
+        // The one flag every shell worth choosing understands.
         .arg("-c")
         .arg(command)
-        // Never inherit the helper's stdin: it is the request stream, and a command
-        // that read from it would eat the agent's next frame.
+        // The helper's stdin is the request stream; a command must not eat a frame.
         .stdin(Stdio::null())
-        // The descriptors are handed to the child as plain file descriptors: the
-        // helper never reads these handles again, so there is nothing to keep async
-        // about them.
+        // Plain descriptors: the helper never reads them back.
         .stdout(Stdio::from(file.into_std().await))
         .stderr(Stdio::from(stderr_file.into_std().await))
-        // A command that forks leaves children behind, and a survivor keeps writing
-        // into the spool file after the job was reported stopped.
+        // A forked command leaves children behind, and a survivor keeps writing into
+        // the spool after the job was reported stopped.
         .process_group(0)
         .kill_on_drop(true)
         .spawn()
         .map_err(|err| {
-            // Naming the shell is the point: `No such file or directory` on its own
-            // reads like something in the command was missing, not the interpreter.
+            // Name the shell, so ENOENT does not read as a missing file in the command.
             format!(
                 "bash failed to start: {} could not be run: {}",
                 shell.display(),
@@ -209,15 +194,13 @@ pub async fn start(request: &Request, jobs: &mut Jobs, shell: &Path) -> Result<S
                 },
                 Err(_elapsed) => {
                     kill_group(pid, libc::SIGTERM);
-                    // The same grace the C agent allows an orderly exit before the
-                    // signal that cannot be caught.
+                    // A moment to exit orderly before the uncatchable signal.
                     tokio::time::sleep(STOP_GRACE).await;
                     kill_group(pid, libc::SIGKILL);
                     let exit = child.wait().await.ok();
                     Status {
                         running: false,
-                        // Reaping the job we just killed, which is what the C agent
-                        // does here, so the report says which signal finished it.
+                        // Reap the job just killed, so the report says which signal ended it.
                         exit_status: exit.as_ref().map(exit_status_of).unwrap_or(-1),
                         timed_out: true,
                         output_error: None,
@@ -269,10 +252,8 @@ pub async fn stop(request: &Request, jobs: &mut Jobs) -> Result<String, String> 
     let Some(index) = jobs.find_index(id, pid) else {
         return Err(format!("bash job not found: job={id} pid={pid}"));
     };
-    // The caller's patience, as the C agent reads it: a stop with no refresh_sec
-    // still allows a second, and a stop asked to wait for half a minute is allowed
-    // to wait that long for a process that is slow to die.  It is a ceiling, not a
-    // delay; a job that dies at once is reported at once.
+    // A stop's own patience is a ceiling, not a delay: with no `refresh_sec` it still
+    // allows a second, and a job that dies at once is reported at once.
     let refresh = request.arg_or("refresh_sec", 0, 0, 3600);
     let patience = if refresh > 0 {
         Duration::from_secs(refresh as u64)
@@ -288,8 +269,8 @@ pub async fn stop(request: &Request, jobs: &mut Jobs) -> Result<String, String> 
             kill_group(pid, libc::SIGKILL);
         }
     }
-    // The reaper still has to notice.  Without this the answer would say "running"
-    // for a process that is already a reaped exit status.
+    // The reaper still has to notice, or the answer would say "running" for a process
+    // that is already reaped.
     wait_for(&mut jobs.list[index], patience).await;
     let text = observation(&mut jobs.list[index]).await;
     if !jobs.list[index].status().running {
@@ -312,10 +293,8 @@ fn requested_job(request: &Request) -> (i32, i64) {
     )
 }
 
-/// The number the C agent prints as `exit_status`: the exit code, or 128+signal
-/// when a signal finished the process, or -1 when neither is known.  A stopped or
-/// timed-out job therefore reads as 143 or 137, which is the number a shell user
-/// already knows how to read, instead of as a generic failure.
+/// The exit code, 128+signal when a signal ended the process, or -1 when neither is
+/// known: a stopped job reads as 143, which is what a shell user expects.
 fn exit_status_of(exit: &std::process::ExitStatus) -> i32 {
     match exit.code() {
         Some(code) => code,
@@ -332,8 +311,7 @@ async fn wait_for(job: &mut Job, limit: Duration) {
     let _ = tokio::time::timeout(limit, receiver.wait_for(|s| !s.running)).await;
 }
 
-/// The snapshot the model sees: same fields, same order, as the C agent, because the
-/// model has already learned what `status=running` followed by a head means.
+/// The snapshot the model sees, in the same fields and order the agent's own output uses.
 async fn observation(job: &mut Job) -> String {
     let status = job.status();
     let first = !job.observed_once;
@@ -378,8 +356,7 @@ async fn observation(job: &mut Job) -> String {
         let (head, shown, byte_limited) = read_head(&job.path).await;
         let truncated = byte_limited || lines > shown;
         if !status.running && !truncated {
-            // Small and finished: the whole thing fits, so show it as the answer
-            // rather than as an excerpt of a file the model then has to open.
+            // Small and finished: show it as the answer, not as an excerpt of a file.
             let _ = write!(out, "<output>\n{head}");
             if !head.is_empty() && !head.ends_with('\n') {
                 let _ = writeln!(out);
@@ -422,15 +399,11 @@ async fn observation(job: &mut Job) -> String {
     out.into_string()
 }
 
-/// The file a job's output is spooled into, named `ds4_agent_output_XXXXXX` the way
-/// the C agent names its own, so a sandbox log and an agent log say the same thing to
-/// whoever is reading them.
+/// The file a job's output is spooled into, named `ds4_agent_output_XXXXXX` like the
+/// agent's own, so a sandbox log and an agent log say the same thing.
 ///
-/// Two things about it are not the defaults.  It is readable and writable by its
-/// owner only: a command's output can hold anything, including a token, and it is not
-/// cleared on exit because the model reads it back by path long after the command is
-/// gone — which is why the tempfile is handed over with `keep` rather than left to a
-/// destructor.  The name, the exclusive create and the mode all come from `tempfile`.
+/// Owner read/write only, and not deleted on exit: the model reads it back by path
+/// long after the command is gone.
 async fn spool_file() -> Result<(File, PathBuf), String> {
     tokio::task::spawn_blocking(|| {
         let temp = NamedTempFile::with_prefix_in("ds4_agent_output_", std::env::temp_dir())
@@ -450,8 +423,8 @@ fn kill_group(pid: u32, signal: i32) {
     unsafe { libc::killpg(pid as i32, signal) };
 }
 
-/// Newlines plus one for a trailing partial line: how many lines the model would
-/// have to page through.  Streamed, because a command can write more than memory.
+/// Newlines plus one for a trailing partial line.  Streamed, because a command can
+/// write more than memory.
 async fn count_lines(path: &Path) -> usize {
     let Ok(mut file) = File::open(path).await else {
         return 0;
@@ -543,8 +516,7 @@ async fn read_tail(path: &Path, want: usize) -> String {
         }
     }
     let window = &window[..read];
-    // When the window starts in the middle of a line, that fragment is not a line:
-    // showing it would put a truncated line at the top of the answer.
+    // A fragment at the start of the window is not a line, so it is not shown.
     let starts_partial = take < len && !window.starts_with(b"\n");
     let mut start = 0;
     let mut seen = 0;

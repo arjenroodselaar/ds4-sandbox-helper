@@ -1,9 +1,7 @@
 //! Tool dispatch for the sandbox side.
 //!
-//! The set of tools here is the set the agent is willing to route: everything the
-//! agent keeps for itself (`view_image`, and any name it does not know) never arrives,
-//! and nothing here reaches outside the box it was started in except by the paths the
-//! model names.
+//! The agent routes nothing here that it does not list, and nothing here reaches
+//! outside the box except by the paths the model names.
 
 use std::path::PathBuf;
 
@@ -16,9 +14,7 @@ pub mod read;
 pub mod search;
 pub mod write;
 
-/// The tools the agent routes here.  Kept next to the dispatch so the two cannot
-/// drift: a name the agent routes that this list does not mention is a bug in one of
-/// them.
+/// The tools the agent routes here, kept next to the dispatch so the two cannot drift.
 pub const SANDBOX_TOOLS: [&str; 9] = [
     "read",
     "more",
@@ -31,29 +27,20 @@ pub const SANDBOX_TOOLS: [&str; 9] = [
     "bash_stop",
 ];
 
-/// The shell used to execute a command when none is explicitly given and this sandbox
-/// has Bash.  Models write their commands for Bash, so arrays, `[[ ]]` and process
-/// substitution are expected to work.
+/// Default shell: models write their commands for bash, so `[[ ]]` and arrays work.
 pub const BASH_SHELL: &str = "/bin/bash";
 
-/// The shell used to execute a command when Bash is not present in the sandbox.
 pub const FALLBACK_SHELL: &str = "/bin/sh";
 
-/// Settings a request does not carry.
-///
-/// `read_lines` is the fallback for the size a bare `read` or `more` returns.  The
-/// agent sends that size in the `limits` object of every request, because it is the
-/// one that knows how big the model's context is, so this only applies to a sender
-/// that says nothing, which in practice means someone driving the helper by hand.
+/// Settings a request does not carry.  `read_lines` is what a bare `read` returns when
+/// the sender sends no `limits`, which in practice means a person at a terminal.
 #[derive(Debug, Clone)]
 pub struct Config {
     pub read_lines: i64,
     pub edit_upto: bool,
-    /// The shell used to execute a command, settled on when the helper started.
     pub shell: PathBuf,
 }
 
-/// The default settings of for a sandbox a helper.
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -64,8 +51,8 @@ impl Default for Config {
     }
 }
 
-/// State that lives for the whole session rather than one request: where `more`
-/// resumes, and which shell commands are still running.
+/// State that lives for the session, not one request: where `more` resumes, and which
+/// shell commands are running.
 #[derive(Default)]
 pub struct Session {
     pub more: Option<read::MoreState>,
@@ -79,8 +66,8 @@ impl Session {
     }
 }
 
-/// Runs one request.  `Err` carries the sentence that follows the agent's own
-/// "Tool error: " prefix, which is why none of these messages start with it.
+/// Runs one request.  `Err` is the sentence after the agent's "Tool error: " prefix,
+/// which is why none of these messages start with it.
 pub async fn run(
     request: &Request,
     session: &mut Session,
@@ -127,9 +114,8 @@ pub async fn run(
         "bash" => bash::start(request, &mut session.jobs, &config.shell).await,
         "bash_status" => bash::status_tool(request, &mut session.jobs).await,
         "bash_stop" => bash::stop(request, &mut session.jobs).await,
-        // The agent answers an unknown name itself and never asks, so reaching this
-        // line means a newer agent is routing something this helper does not know.
-        // Saying so is better than pretending the tool did nothing.
+        // The agent answers unknown names itself, so this is a newer agent routing
+        // a tool this helper does not have.
         other => Err(format!("unknown tool: {other}")),
     }
 }
@@ -154,8 +140,7 @@ mod tests {
 
     #[tokio::test]
     async fn every_routed_name_reaches_its_tool() {
-        // A name in SANDBOX_TOOLS that the dispatch does not handle would be
-        // indistinguishable from an unknown tool at runtime, so it is checked here.
+        // A name routed but not dispatched would look like an unknown tool.
         for name in SANDBOX_TOOLS {
             let result = call(name, r#""path":"/definitely/not/here""#).await;
             let err = result.unwrap_err();

@@ -1,20 +1,17 @@
 //! `search`: walk a tree and report matching lines.
 //!
-//! Two rules do the heavy lifting.  Results stream into a byte budget and the walk
-//! stops when it is full, because a repository-wide search for a common word has no
-//! natural end and the model's context does.  And anything the walk could not read is
-//! counted and reported in a tail note rather than ignored: a search that quietly
-//! skipped a third of the tree and said "3 matches" would be worse than one that said
-//! nothing, because the model would treat an incomplete answer as a complete one.
+//! Results stream into a byte budget and the walk stops when it is full, because a
+//! repository-wide search has no natural end.  Anything unreadable is counted and
+//! reported in a tail note: an incomplete answer read as a complete one is worse than
+//! no answer.
 
 use std::fmt::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use tokio::io::AsyncBufReadExt;
 
-/// A recursive `async fn` cannot return `impl Future` (it would need itself by
-/// value), so the walk hands back a boxed future instead.  The allocation is per
-/// directory, which is nothing next to reading the files inside it.
+/// A recursive `async fn` cannot return `impl Future`, so the walk boxes its future.
+/// The allocation is once per directory.
 type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 
 use regex::Regex;
@@ -97,10 +94,8 @@ pub async fn search(request: &Request) -> Result<String, String> {
 
     let case_sensitive = request.bool_or("case_sensitive", true);
     let matcher = if mode == "regex" {
-        // The tool documents POSIX extended regex, and this crate's syntax is a
-        // superset of ERE for everything a model normally writes.  Where they differ
-        // (backreferences, which ERE has and this does not) the pattern simply fails
-        // to compile and the error text says so.
+        // Documented as POSIX extended regex, which this syntax is a superset of for
+        // what a model writes; what differs (backreferences) fails to compile.
         match RegexBuilder::new(query)
             .case_insensitive(!case_sensitive)
             .build()
@@ -167,9 +162,6 @@ fn walk<'a>(ctx: &'a mut Ctx<'_>, path: &'a str, depth: usize) -> BoxFuture<'a, 
             ctx.stop(path, "directory depth limit reached");
             return;
         }
-        // The root is followed (a link named on the command line is what the model
-        // meant); anything below it is lstat'd, so a link inside the tree is reported
-        // rather than walked.
         let meta = if depth == 0 {
             tokio::fs::metadata(path).await
         } else {
@@ -212,8 +204,7 @@ fn walk<'a>(ctx: &'a mut Ctx<'_>, path: &'a str, depth: usize) -> BoxFuture<'a, 
             if name == "." || name == ".." {
                 continue;
             }
-            // Version control internals are object files and packfiles: searching them
-            // spends the whole result budget on content the model did not write.
+            // Object files and packfiles would spend the whole budget.
             if name == ".git" {
                 continue;
             }
@@ -232,8 +223,7 @@ async fn search_file(ctx: &mut Ctx<'_>, path: &str) {
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.to_string());
-        // Either the name or the whole path matching is enough, which is what lets
-        // `"glob": "*.c"` and `"glob": "src/*.c"` both mean what they say.
+        // Either the name or the whole path may match, so `*.c` and `src/*.c` both work.
         if !glob_match(glob, &base) && !glob_match(glob, path) {
             return;
         }
@@ -248,8 +238,7 @@ async fn search_file(ctx: &mut Ctx<'_>, path: &str) {
     };
     let mut reader = tokio::io::BufReader::with_capacity(64 * 1024, file);
 
-    // Only the current line and the context ring are resident: a file can be a
-    // gigabyte and a search over it still has to cost a fixed amount.
+    // Only the current line and the context ring are resident, whatever the file's size.
     let mut ring: Vec<Option<String>> = vec![None; RING];
     let mut printed_file = false;
     let mut line = 0usize;
@@ -257,8 +246,8 @@ async fn search_file(ctx: &mut Ctx<'_>, path: &str) {
     let mut after = 0usize;
 
     loop {
-        // Trailing context has to be read even after the result cap is reached, or
-        // the last match's context would be cut off mid-sentence.
+        // Trailing context is read even past the result cap, so a match's context is
+        // not cut off mid-sentence.
         if (ctx.results >= ctx.max_results && after == 0) || ctx.out.truncated() {
             break;
         }
@@ -314,8 +303,7 @@ fn emit_line(ctx: &mut Ctx, ring: &[Option<String>], number: usize) {
 enum ReadLine {
     Line(String),
     Eof,
-    /// A NUL, or a line so long it would fill the whole answer by itself.  Both mean
-    /// "this is not text the model can read", and the file is reported as skipped.
+    /// A NUL, or a line long enough to fill the answer by itself: not text to read.
     Binary,
     Io(String),
 }
@@ -323,9 +311,8 @@ enum ReadLine {
 async fn read_line(reader: &mut tokio::io::BufReader<tokio::fs::File>) -> ReadLine {
     let mut bytes: Vec<u8> = Vec::new();
     loop {
-        // One byte at a time out of the buffer, not out of the file: the line has to
-        // stop at the first NUL or the 128 KiB mark, and either can fall between two
-        // reads.
+        // Bytes come from the buffer, not the file: the NUL or the 128 KiB mark can
+        // fall between two reads.
         let byte = match reader.fill_buf().await {
             Ok(buf) => match buf.first() {
                 Some(byte) => *byte,
@@ -346,8 +333,7 @@ async fn read_line(reader: &mut tokio::io::BufReader<tokio::fs::File>) -> ReadLi
                 return ReadLine::Line(String::from_utf8_lossy(&bytes).into_owned());
             }
             b'\r' => {
-                // A CRLF is one line break: the newline after a carriage return
-                // belongs to the line just read, not to the next one.
+                // A CRLF is one line break, not two.
                 if let Ok(buf) = reader.fill_buf().await
                     && buf.first() == Some(&b'\n')
                 {
@@ -366,8 +352,7 @@ async fn read_line(reader: &mut tokio::io::BufReader<tokio::fs::File>) -> ReadLi
 }
 
 /// fnmatch(3) with flags 0: `*` crosses `/`, `?` is one character, and `[...]` is a
-/// set that may start with `!` or `^` to negate.  Written here rather than taken from
-/// a crate because the tool's contract is exactly this much pattern language.
+/// set that may start with `!` or `^` to negate.
 fn glob_match(pattern: &str, text: &str) -> bool {
     let pattern = pattern.as_bytes();
     let text = text.as_bytes();
@@ -463,8 +448,7 @@ mod tests {
     use super::*;
     use crate::protocol::parse_request;
 
-    /// A small source tree, in a directory that deletes itself with the test.  The
-    /// caller keeps the directory by holding the second half of the pair.
+    /// A small source tree in a self-deleting directory; the caller keeps the directory.
     fn tree() -> (PathBuf, tempfile::TempDir) {
         let temp = tempfile::TempDir::with_prefix("ds4-helper-search-").unwrap();
         let root = temp.path().to_path_buf();
