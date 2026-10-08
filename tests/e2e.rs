@@ -867,6 +867,57 @@ async fn the_read_size_that_comes_with_the_request_wins() {
     helper.finish().await;
 }
 
+/// The size of a job's output is read from the spool file here, where the C agent counts
+/// the bytes it wrote itself, so a file that cannot be read has to be said out loud
+/// rather than answered as an empty one.
+#[tokio::test]
+async fn output_that_cannot_be_read_back_is_not_reported_as_empty() {
+    let mut helper = Helper::start(&[]).await;
+    let started = helper
+        .ok(
+            "bash",
+            serde_json::json!({"command": "echo out; sleep 30", "refresh_sec": "0"}),
+        )
+        .await;
+    let job = started
+        .split("job=")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .expect("a job number");
+    let spool = started
+        .lines()
+        .find_map(|line| line.strip_prefix("output_path="))
+        .and_then(|rest| rest.split(" (").next())
+        .expect("an output path");
+
+    // The model is shown the path and can do what it likes with it.
+    let removed = helper
+        .ok(
+            "bash",
+            serde_json::json!({"command": format!("rm -f {spool}")}),
+        )
+        .await;
+    assert!(removed.contains("status=done"), "{removed}");
+
+    let later = helper
+        .ok("bash_status", serde_json::json!({"job": job}))
+        .await;
+    assert!(later.contains("status=running"), "{later}");
+    assert!(
+        later.contains("Tool error: command output could not be read: No such file"),
+        "{later}"
+    );
+    assert!(!later.contains("<output>"), "{later}");
+    assert!(!later.contains("0 bytes"), "{later}");
+
+    let stopped = helper
+        .ok("bash_stop", serde_json::json!({"job": job}))
+        .await;
+    assert!(stopped.contains("status=done"), "{stopped}");
+
+    helper.finish().await;
+}
+
 // --------------------------------------------------------------------------------
 // Session teardown.  A job runs in a process group of its own, which is what keeps a
 // runaway command from being able to hurt the helper, and what means the agent's

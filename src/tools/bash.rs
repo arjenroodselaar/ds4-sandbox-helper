@@ -12,7 +12,9 @@
 //! Each job gets a task that awaits its child and enforces the deadline, and a waiter
 //! subscribes to a watch channel instead of polling, so a finished job wakes whoever
 //! is waiting for it.  Output goes straight to the spool file rather than through a
-//! pipe, which is one fewer buffer that can fill and stall the command.
+//! pipe, which is one fewer buffer that can fill and stall the command.  Nothing writes
+//! to that file from this side, so a write that fails inside a command, on a full disk
+//! say, arrives here as nothing but a non-zero exit status.
 //!
 //! A job outlives the request that started it, so the session ending is what ends it.
 //! The jobs run in process groups of their own, which the agent's teardown signal does
@@ -64,7 +66,8 @@ pub struct Status {
     pub running: bool,
     pub exit_status: i32,
     pub timed_out: bool,
-    /// Output the spool file could not hold.  Reported, never quietly dropped.
+    /// The child could not be waited for, so the exit status is unknown.  Output that
+    /// cannot be read back is reported by `observation`, which is where that is known.
     pub output_error: Option<String>,
     /// When the child exited, so elapsed time stops there.
     pub ended_at: Option<Instant>,
@@ -395,49 +398,59 @@ async fn observation(job: &mut Job) -> String {
     }
 
     let path_text = job.path.to_string_lossy().into_owned();
-    let bytes = tokio::fs::metadata(&job.path)
-        .await
-        .map(|meta| meta.len() as usize)
-        .unwrap_or(0);
-    let lines = count_lines(&job.path).await;
-
-    if bytes == 0 {
-        let _ = write!(out, "<output>\n</output>\n");
-    } else if first {
-        let (head, shown, byte_limited) = read_head(&job.path).await;
-        let truncated = byte_limited || lines > shown;
-        if !status.running && !truncated {
-            // Small and finished, so this is the answer rather than an excerpt of a file.
-            let _ = write!(out, "<output>\n{head}");
-            if !head.is_empty() && !head.ends_with('\n') {
-                let _ = writeln!(out);
-            }
-            let _ = writeln!(out, "</output>");
-        } else {
-            let _ = write!(
+    match tokio::fs::metadata(&job.path).await {
+        Err(err) => {
+            // A spool that cannot be read is not a spool that holds nothing.  The C
+            // agent counts the bytes it wrote itself, so a zero there means the
+            // command wrote nothing, and only the file can say that here.
+            let _ = writeln!(
                 out,
-                "output_path={path_text} ({bytes} bytes, {lines} lines)\n<head -{HEAD_LINES} {path_text}>\n{head}"
+                "Tool error: command output could not be read: {}",
+                files::err_message(&err)
             );
-            if !head.is_empty() && !head.ends_with('\n') {
-                let _ = writeln!(out);
+        }
+        Ok(meta) => {
+            let bytes = meta.len() as usize;
+            let lines = count_lines(&job.path).await;
+            if bytes == 0 {
+                let _ = write!(out, "<output>\n</output>\n");
+            } else if first {
+                let (head, shown, byte_limited) = read_head(&job.path).await;
+                let truncated = byte_limited || lines > shown;
+                if !status.running && !truncated {
+                    // Small and finished, so this is the answer rather than an excerpt of a file.
+                    let _ = write!(out, "<output>\n{head}");
+                    if !head.is_empty() && !head.ends_with('\n') {
+                        let _ = writeln!(out);
+                    }
+                    let _ = writeln!(out, "</output>");
+                } else {
+                    let _ = write!(
+                        out,
+                        "output_path={path_text} ({bytes} bytes, {lines} lines)\n<head -{HEAD_LINES} {path_text}>\n{head}"
+                    );
+                    if !head.is_empty() && !head.ends_with('\n') {
+                        let _ = writeln!(out);
+                    }
+                    let _ = writeln!(out, "</head>");
+                }
+            } else {
+                let want = if status.running {
+                    PROGRESS_TAIL_LINES
+                } else {
+                    FINAL_TAIL_LINES
+                };
+                let tail = read_tail(&job.path, want).await;
+                let _ = write!(
+                    out,
+                    "output_path={path_text} ({bytes} bytes, {lines} lines)\n<tail -{want} {path_text}>\n{tail}"
+                );
+                if !tail.is_empty() && !tail.ends_with('\n') {
+                    let _ = writeln!(out);
+                }
+                let _ = writeln!(out, "</tail>");
             }
-            let _ = writeln!(out, "</head>");
         }
-    } else {
-        let want = if status.running {
-            PROGRESS_TAIL_LINES
-        } else {
-            FINAL_TAIL_LINES
-        };
-        let tail = read_tail(&job.path, want).await;
-        let _ = write!(
-            out,
-            "output_path={path_text} ({bytes} bytes, {lines} lines)\n<tail -{want} {path_text}>\n{tail}"
-        );
-        if !tail.is_empty() && !tail.ends_with('\n') {
-            let _ = writeln!(out);
-        }
-        let _ = writeln!(out, "</tail>");
     }
 
     if status.running {
