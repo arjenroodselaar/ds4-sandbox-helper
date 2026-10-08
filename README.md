@@ -30,7 +30,7 @@ The first frame is the helper's own, written before a byte of a request is read:
 
 ```
 149
-{"id":0,"text":"ds4-sandbox-helper 0.1.0 ready: dir /home/ds4-sandbox-helper, shell /bin/bash, read_lines default 120, upto marker off","type":"log"}
+{"id":0,"text":"ds4-sandbox-helper 0.1.1 ready: dir /home/ds4-sandbox-helper, shell /bin/bash, read_lines default 120, upto marker off","type":"log"}
 ```
 
 The word `ready` is what the agent blocks on, and it blocks before loading a
