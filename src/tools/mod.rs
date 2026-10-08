@@ -83,25 +83,21 @@ pub async fn run(
 ) -> Result<String, String> {
     match request.tool.as_str() {
         "read" => {
-            let whole = request.bool_or("whole", false);
-            let raw = request.bool_or("raw", false);
-            read::read_range(
-                request.arg("path").unwrap_or(""),
-                request.arg_or("start_line", 1, 1, i64::from(i32::MAX)),
-                request.arg_or(
-                    "max_lines",
-                    request.read_lines_or(config.read_lines),
-                    1,
-                    i64::from(i32::MAX),
-                ),
-                whole,
-                raw,
-                0,
-                false,
-                &mut session.more,
-                true,
-            )
-            .await
+            let range = read::Range {
+                start_line: request.arg_or("start_line", 1, 1, i64::from(i32::MAX)),
+                whole_file: request.bool_or("whole", false),
+                bare: request.bool_or("raw", false),
+                ..read::Range::new(
+                    request.arg("path").unwrap_or(""),
+                    request.arg_or(
+                        "max_lines",
+                        request.read_lines_or(config.read_lines),
+                        1,
+                        i64::from(i32::MAX),
+                    ),
+                )
+            };
+            read::read_range(&range, &mut session.more, true).await
         }
         "more" => {
             read::more(

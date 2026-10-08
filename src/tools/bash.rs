@@ -60,28 +60,26 @@ const STOP_WAIT: Duration = Duration::from_secs(5);
 /// to fit inside a second.  A job that needs longer is killed rather than waited out.
 const TEARDOWN_GRACE: Duration = Duration::from_millis(400);
 
-/// What the watcher task knows about a job, cloned into every observation.
-#[derive(Debug, Clone)]
-pub struct Status {
-    pub running: bool,
-    pub exit_status: i32,
-    pub timed_out: bool,
-    /// The child could not be waited for, so the exit status is unknown.  Output that
-    /// cannot be read back is reported by `observation`, which is where that is known.
-    pub output_error: Option<String>,
-    /// When the child exited, so elapsed time stops there.
-    pub ended_at: Option<Instant>,
+/// What the watcher task knows about a job, cloned into every observation.  Only a
+/// reaped job has an exit status, so the ended state is what carries those fields.
+#[derive(Debug, Clone, Default)]
+pub enum Status {
+    #[default]
+    Running,
+    Done {
+        exit_status: i32,
+        timed_out: bool,
+        /// The child could not be waited for, so the exit status is unknown.  Output that
+        /// cannot be read back is reported by `observation`, which is where that is known.
+        output_error: Option<String>,
+        /// When the child exited, so elapsed time stops there.
+        ended_at: Instant,
+    },
 }
 
-impl Default for Status {
-    fn default() -> Self {
-        Status {
-            running: true,
-            exit_status: 0,
-            timed_out: false,
-            output_error: None,
-            ended_at: None,
-        }
+impl Status {
+    pub fn is_running(&self) -> bool {
+        matches!(self, Status::Running)
     }
 }
 
@@ -102,10 +100,9 @@ impl Job {
     }
 
     fn elapsed(&self, status: &Status) -> f64 {
-        match status.ended_at {
-            Some(end) => end.duration_since(self.started).as_secs_f64(),
-            None if status.running => self.started.elapsed().as_secs_f64(),
-            None => 0.0,
+        match status {
+            Status::Running => self.started.elapsed().as_secs_f64(),
+            Status::Done { ended_at, .. } => ended_at.duration_since(self.started).as_secs_f64(),
         }
     }
 }
@@ -201,19 +198,17 @@ pub async fn start(request: &Request, jobs: &mut Jobs, shell: &Path) -> Result<S
         let mut reaper = GroupKill { pid, armed: true };
         let status =
             match tokio::time::timeout(Duration::from_secs_f64(timeout), child.wait()).await {
-                Ok(Ok(exit)) => Status {
-                    running: false,
+                Ok(Ok(exit)) => Status::Done {
                     exit_status: exit_status_of(&exit),
                     timed_out: false,
                     output_error: None,
-                    ended_at: Some(Instant::now()),
+                    ended_at: Instant::now(),
                 },
-                Ok(Err(err)) => Status {
-                    running: false,
+                Ok(Err(err)) => Status::Done {
                     exit_status: -1,
                     timed_out: false,
                     output_error: Some(err.to_string()),
-                    ended_at: Some(Instant::now()),
+                    ended_at: Instant::now(),
                 },
                 Err(_elapsed) => {
                     kill_group(pid, libc::SIGTERM);
@@ -221,13 +216,12 @@ pub async fn start(request: &Request, jobs: &mut Jobs, shell: &Path) -> Result<S
                     tokio::time::sleep(STOP_GRACE).await;
                     kill_group(pid, libc::SIGKILL);
                     let exit = child.wait().await.ok();
-                    Status {
-                        running: false,
+                    Status::Done {
                         // Reap the job just killed, so the report says which signal ended it.
                         exit_status: exit.as_ref().map(exit_status_of).unwrap_or(-1),
                         timed_out: true,
                         output_error: None,
-                        ended_at: Some(Instant::now()),
+                        ended_at: Instant::now(),
                     }
                 }
             };
@@ -248,7 +242,7 @@ pub async fn start(request: &Request, jobs: &mut Jobs, shell: &Path) -> Result<S
 
     wait_for(&mut jobs.list[index], Duration::from_secs(refresh)).await;
     let text = observation(&mut jobs.list[index]).await;
-    if !jobs.list[index].status().running {
+    if !jobs.list[index].status().is_running() {
         jobs.remove(id).await;
     }
     Ok(text)
@@ -265,7 +259,7 @@ pub async fn status_tool(request: &Request, jobs: &mut Jobs) -> Result<String, S
         wait_for(&mut jobs.list[index], Duration::from_secs(refresh)).await;
     }
     let text = observation(&mut jobs.list[index]).await;
-    if !jobs.list[index].status().running {
+    if !jobs.list[index].status().is_running() {
         jobs.remove(id).await;
     }
     Ok(text)
@@ -285,11 +279,11 @@ pub async fn stop(request: &Request, jobs: &mut Jobs) -> Result<String, String> 
         STOP_WAIT
     };
 
-    if jobs.list[index].status().running {
+    if jobs.list[index].status().is_running() {
         let pid = jobs.list[index].pid;
         kill_group(pid, libc::SIGTERM);
         wait_for(&mut jobs.list[index], STOP_GRACE).await;
-        if jobs.list[index].status().running {
+        if jobs.list[index].status().is_running() {
             kill_group(pid, libc::SIGKILL);
         }
     }
@@ -297,7 +291,7 @@ pub async fn stop(request: &Request, jobs: &mut Jobs) -> Result<String, String> 
     // that is already reaped.
     wait_for(&mut jobs.list[index], patience).await;
     let text = observation(&mut jobs.list[index]).await;
-    if !jobs.list[index].status().running {
+    if !jobs.list[index].status().is_running() {
         jobs.remove(id).await;
     }
     Ok(text)
@@ -317,7 +311,7 @@ pub async fn stop(request: &Request, jobs: &mut Jobs) -> Result<String, String> 
 pub async fn finish(jobs: &mut Jobs) {
     let mut stopping = Vec::new();
     for job in jobs.list.drain(..) {
-        if !job.status().running {
+        if !job.status().is_running() {
             let _ = tokio::fs::remove_file(&job.path).await;
             continue;
         }
@@ -333,7 +327,7 @@ pub async fn finish(jobs: &mut Jobs) {
     for job in stopping {
         // The watcher is what reaps and updates the status, so still-running here
         // means the group did not end within the grace.
-        if job.status().running {
+        if job.status().is_running() {
             kill_group(job.pid, libc::SIGKILL);
         }
         let _ = tokio::fs::remove_file(&job.path).await;
@@ -358,11 +352,11 @@ fn exit_status_of(exit: &std::process::ExitStatus) -> i32 {
 
 /// Waits until the job is no longer running, or until `limit` has passed.
 async fn wait_for(job: &mut Job, limit: Duration) {
-    if !job.status().running {
+    if !job.status().is_running() {
         return;
     }
     let mut receiver = job.status.subscribe();
-    let _ = tokio::time::timeout(limit, receiver.wait_for(|s| !s.running)).await;
+    let _ = tokio::time::timeout(limit, receiver.wait_for(|s| !s.is_running())).await;
 }
 
 /// The snapshot the model sees, in the same fields and order the agent's own output uses.
@@ -373,28 +367,37 @@ async fn observation(job: &mut Job) -> String {
 
     let mut out = Budget::new(MAX_TOOL_BYTES.saturating_sub(4096));
     let elapsed = job.elapsed(&status);
-    if status.running {
-        let _ = writeln!(
-            out,
-            "bash job={} pid={} status=running elapsed_sec={:.1} timeout_sec={:.0}",
-            job.id, job.pid, elapsed, job.timeout_sec
-        );
-    } else {
-        let _ = writeln!(
-            out,
-            "bash job={} pid={} status=done elapsed_sec={:.1} timed_out={}",
-            job.id,
-            job.pid,
-            elapsed,
-            i32::from(status.timed_out)
-        );
-        let _ = writeln!(out, "exit_status={}", status.exit_status);
-    }
-    if let Some(err) = &status.output_error {
-        let _ = writeln!(
-            out,
-            "Tool error: command output could not be captured completely: {err}"
-        );
+    let running = status.is_running();
+    match &status {
+        Status::Running => {
+            let _ = writeln!(
+                out,
+                "bash job={} pid={} status=running elapsed_sec={:.1} timeout_sec={:.0}",
+                job.id, job.pid, elapsed, job.timeout_sec
+            );
+        }
+        Status::Done {
+            exit_status,
+            timed_out,
+            output_error,
+            ..
+        } => {
+            let _ = writeln!(
+                out,
+                "bash job={} pid={} status=done elapsed_sec={:.1} timed_out={}",
+                job.id,
+                job.pid,
+                elapsed,
+                i32::from(*timed_out)
+            );
+            let _ = writeln!(out, "exit_status={exit_status}");
+            if let Some(err) = output_error {
+                let _ = writeln!(
+                    out,
+                    "Tool error: command output could not be captured completely: {err}"
+                );
+            }
+        }
     }
 
     let path_text = job.path.to_string_lossy().into_owned();
@@ -410,14 +413,23 @@ async fn observation(job: &mut Job) -> String {
             );
         }
         Ok(meta) => {
-            let bytes = meta.len() as usize;
-            let lines = count_lines(&job.path).await;
+            let bytes = meta.len();
+            // One open serves the line count and the excerpt.  A spool that is there
+            // and still cannot be opened is what the sentinel line reports.
+            let mut file = File::open(&job.path).await.ok();
+            let lines = match &mut file {
+                Some(file) => count_lines(file).await,
+                None => 0,
+            };
             if bytes == 0 {
                 let _ = write!(out, "<output>\n</output>\n");
             } else if first {
-                let (head, shown, byte_limited) = read_head(&job.path).await;
+                let (head, shown, byte_limited) = match &mut file {
+                    Some(file) => read_head(file, bytes).await,
+                    None => ("<failed to reopen output file>\n".to_string(), 0, false),
+                };
                 let truncated = byte_limited || lines > shown;
-                if !status.running && !truncated {
+                if !running && !truncated {
                     // Small and finished, so this is the answer rather than an excerpt of a file.
                     let _ = write!(out, "<output>\n{head}");
                     if !head.is_empty() && !head.ends_with('\n') {
@@ -435,12 +447,15 @@ async fn observation(job: &mut Job) -> String {
                     let _ = writeln!(out, "</head>");
                 }
             } else {
-                let want = if status.running {
+                let want = if running {
                     PROGRESS_TAIL_LINES
                 } else {
                     FINAL_TAIL_LINES
                 };
-                let tail = read_tail(&job.path, want).await;
+                let tail = match &mut file {
+                    Some(file) => read_tail(file, want).await,
+                    None => "<failed to reopen output file>\n".to_string(),
+                };
                 let _ = write!(
                     out,
                     "output_path={path_text} ({bytes} bytes, {lines} lines)\n<tail -{want} {path_text}>\n{tail}"
@@ -453,7 +468,7 @@ async fn observation(job: &mut Job) -> String {
         }
     }
 
-    if status.running {
+    if running {
         let _ = write!(
             out,
             "\nUse bash_status job={} to get info before refresh time; use bash_stop job={} to stop execution\n",
@@ -515,10 +530,7 @@ impl Drop for GroupKill {
 
 /// Newlines plus one for a trailing partial line.  Streamed, because a command can
 /// write more than memory.
-async fn count_lines(path: &Path) -> usize {
-    let Ok(mut file) = File::open(path).await else {
-        return 0;
-    };
+async fn count_lines(file: &mut File) -> usize {
     let mut lines = 0usize;
     let mut last = None;
     let mut buf = vec![0u8; 64 * 1024];
@@ -543,11 +555,12 @@ async fn count_lines(path: &Path) -> usize {
 }
 
 /// The first lines of the output, capped at [`HEAD_BYTES`].  Reports what stopped
-/// it, because head-versus-whole-output is decided by that.
-async fn read_head(path: &Path) -> (String, usize, bool) {
-    let Ok(mut file) = File::open(path).await else {
-        return ("<failed to reopen output file>\n".to_string(), 0, false);
-    };
+/// it, because head-versus-whole-output is decided by that.  `file_bytes` is the size
+/// the caller already counted, so the header and this cap agree on one number.
+async fn read_head(file: &mut File, file_bytes: u64) -> (String, usize, bool) {
+    if file.rewind().await.is_err() {
+        return ("<failed to seek output file>\n".to_string(), 0, false);
+    }
     let mut buf = vec![0u8; HEAD_BYTES as usize];
     let mut taken = 0;
     while taken < buf.len() {
@@ -557,10 +570,6 @@ async fn read_head(path: &Path) -> (String, usize, bool) {
             Err(_) => break,
         }
     }
-    let total = tokio::fs::metadata(path)
-        .await
-        .map(|m| m.len())
-        .unwrap_or(0);
     let window = &buf[..taken];
     let mut lines = 0;
     let mut cut = window.len();
@@ -575,7 +584,7 @@ async fn read_head(path: &Path) -> (String, usize, bool) {
     }
     let shown = window[..cut].iter().filter(|b| **b == b'\n').count()
         + usize::from(!window[..cut].is_empty() && window[cut - 1] != b'\n');
-    let byte_limited = taken as u64 >= HEAD_BYTES && total > HEAD_BYTES;
+    let byte_limited = taken as u64 >= HEAD_BYTES && file_bytes > HEAD_BYTES;
     (
         String::from_utf8_lossy(&window[..cut]).into_owned(),
         shown,
@@ -584,10 +593,7 @@ async fn read_head(path: &Path) -> (String, usize, bool) {
 }
 
 /// The last `want` lines, read from the end so a long log costs a fixed amount.
-async fn read_tail(path: &Path, want: usize) -> String {
-    let Ok(mut file) = File::open(path).await else {
-        return "<failed to reopen output file>\n".to_string();
-    };
+async fn read_tail(file: &mut File, want: usize) -> String {
     let Ok(meta) = file.metadata().await else {
         return String::new();
     };

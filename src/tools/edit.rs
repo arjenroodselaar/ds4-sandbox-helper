@@ -106,11 +106,12 @@ fn find_old_span(
     allow_upto: bool,
 ) -> Result<(usize, usize, bool), String> {
     let upto = find(old, UPTO_MARKER);
-    if !allow_upto || upto.is_none() {
+    // Without a marker, or in a caller that does not allow one, `old` is literal text
+    // that has to match somewhere on its own.
+    let Some(head_len) = upto.filter(|_| allow_upto) else {
         let offset = find_unique(data, old, "old text")?;
         return Ok((offset, old.len(), false));
-    }
-    let head_len = upto.expect("checked");
+    };
     if find(&old[head_len + UPTO_MARKER.len()..], UPTO_MARKER).is_some() {
         return Err("old text contains more than one [upto] marker".into());
     }

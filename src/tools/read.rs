@@ -35,6 +35,39 @@ pub struct MoreState {
     pub bare: bool,
 }
 
+/// What one read asks for: which part of which file, and whether the answer is counted
+/// and headed or left exactly as stored.
+#[derive(Debug, Clone, Copy)]
+pub struct Range<'a> {
+    pub path: &'a str,
+    pub start_line: i64,
+    pub max_lines: i64,
+    /// Answer with the whole file, ignoring the line span.
+    pub whole_file: bool,
+    /// No line numbers, no header, no resume note.
+    pub bare: bool,
+    /// Where to start reading bytes, which is how `more` does not re-read what it
+    /// already returned.
+    pub offset: usize,
+    /// `offset` is inside a line rather than at its start.
+    pub mid_line: bool,
+}
+
+impl<'a> Range<'a> {
+    /// A read of `max_lines` lines from the top of the file, counted and headed.
+    pub fn new(path: &'a str, max_lines: i64) -> Self {
+        Range {
+            path,
+            start_line: 1,
+            max_lines,
+            whole_file: false,
+            bare: false,
+            offset: 0,
+            mid_line: false,
+        }
+    }
+}
+
 /// A byte cursor with look-ahead and a running position, which is what the resume
 /// offset is measured in.  The look-ahead is the buffered reader's own buffer.  Peek
 /// at the next byte, then take it or not.
@@ -69,29 +102,19 @@ impl Cursor {
     }
 }
 
-/// Reads `max_lines` lines from `start_line`, from `offset` bytes into the file.
-/// `mid_line` marks a resumed read whose offset is not at a line start.
-#[allow(clippy::too_many_arguments)]
+/// Reads `range.max_lines` lines from `range.start_line`, and records where to resume
+/// when `set_more` says this read is the one `more` should continue from.
 pub async fn read_range(
-    path: &str,
-    start_line: i64,
-    max_lines: i64,
-    whole_file: bool,
-    bare: bool,
-    offset: usize,
-    mid_line: bool,
+    range: &Range<'_>,
     more: &mut Option<MoreState>,
     set_more: bool,
 ) -> Result<String, String> {
-    if path.is_empty() {
+    if range.path.is_empty() {
         // Nothing is touched, resume state included, so `more` still continues the
         // last good read.
         return Err("read requires path".into());
     }
-    let result = read_inner(
-        path, start_line, max_lines, whole_file, bare, offset, mid_line, more, set_more,
-    )
-    .await;
+    let result = read_inner(range, more, set_more).await;
     if result.is_err() && set_more {
         // A failed read leaves nothing to continue.
         *more = None;
@@ -99,18 +122,20 @@ pub async fn read_range(
     result
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn read_inner(
-    path: &str,
-    start_line: i64,
-    max_lines: i64,
-    whole_file: bool,
-    bare: bool,
-    offset: usize,
-    mid_line: bool,
+    range: &Range<'_>,
     more: &mut Option<MoreState>,
     set_more: bool,
 ) -> Result<String, String> {
+    let Range {
+        path,
+        start_line,
+        max_lines,
+        whole_file,
+        bare,
+        offset,
+        mid_line,
+    } = *range;
     let mut cur = Cursor::open(path, offset)
         .await
         .map_err(|err| format!("read failed: {}", files::err_message(&err)))?;
@@ -249,18 +274,14 @@ pub async fn more(state: &mut Option<MoreState>, count: i64) -> Result<String, S
     let Some(saved) = state.clone() else {
         return Err("no previous output to continue".into());
     };
-    read_range(
-        &saved.path,
-        saved.next_line as i64,
-        count,
-        false,
-        saved.bare,
-        saved.byte_offset,
-        saved.mid_line,
-        state,
-        true,
-    )
-    .await
+    let range = Range {
+        start_line: saved.next_line as i64,
+        bare: saved.bare,
+        offset: saved.byte_offset,
+        mid_line: saved.mid_line,
+        ..Range::new(&saved.path, count)
+    };
+    read_range(&range, state, true).await
 }
 
 fn io_failure(err: std::io::Error) -> String {
@@ -282,13 +303,10 @@ mod tests {
     #[allow(clippy::type_complexity)]
     async fn read(path: &std::path::Path, start: i64, count: i64) -> Result<String, String> {
         read_range(
-            path.to_str().unwrap(),
-            start,
-            count,
-            false,
-            false,
-            0,
-            false,
+            &Range {
+                start_line: start,
+                ..Range::new(path.to_str().unwrap(), count)
+            },
             &mut None,
             false,
         )
@@ -313,19 +331,9 @@ mod tests {
         let body = (1..=50).map(|n| format!("line {n}\n")).collect::<String>();
         let (path, _dir) = write_file("partial", body.as_bytes());
         let mut state = None;
-        let text = read_range(
-            path.to_str().unwrap(),
-            1,
-            10,
-            false,
-            false,
-            0,
-            false,
-            &mut state,
-            true,
-        )
-        .await
-        .unwrap();
+        let text = read_range(&Range::new(path.to_str().unwrap(), 10), &mut state, true)
+            .await
+            .unwrap();
         assert!(text.contains("lines 1-10 (partial read)"), "{text}");
         // "line 1\n" through "line 9\n" are 7 bytes each, "line 10\n" is 8.
         assert!(
@@ -366,13 +374,10 @@ mod tests {
         assert!(!text.contains('\r'), "{text:?}");
 
         let bare = read_range(
-            path.to_str().unwrap(),
-            1,
-            10,
-            false,
-            true,
-            0,
-            false,
+            &Range {
+                bare: true,
+                ..Range::new(path.to_str().unwrap(), 10)
+            },
             &mut None,
             false,
         )
@@ -399,13 +404,10 @@ mod tests {
         let body = "x\n".repeat(600 * 1024);
         let (path, _dir) = write_file("whole", body.as_bytes());
         let err = read_range(
-            path.to_str().unwrap(),
-            1,
-            500,
-            true,
-            false,
-            0,
-            false,
+            &Range {
+                whole_file: true,
+                ..Range::new(path.to_str().unwrap(), 500)
+            },
             &mut None,
             false,
         )
@@ -421,13 +423,7 @@ mod tests {
         let (path, _dir) = write_file("wide", body.as_bytes());
         let mut state = None;
         let text = read_range(
-            path.to_str().unwrap(),
-            1,
-            1_000_000,
-            false,
-            false,
-            0,
-            false,
+            &Range::new(path.to_str().unwrap(), 1_000_000),
             &mut state,
             true,
         )
@@ -452,7 +448,7 @@ mod tests {
             "no previous output to continue"
         );
         assert_eq!(
-            read_range("", 1, 10, false, false, 0, false, &mut None, false)
+            read_range(&Range::new("", 10), &mut None, false)
                 .await
                 .unwrap_err(),
             "read requires path"
@@ -472,19 +468,9 @@ mod tests {
     async fn a_failed_read_clears_the_resume_state() {
         let (path, _dir) = write_file("clears", &"line\n".repeat(200).into_bytes());
         let mut state = None;
-        read_range(
-            path.to_str().unwrap(),
-            1,
-            5,
-            false,
-            false,
-            0,
-            false,
-            &mut state,
-            true,
-        )
-        .await
-        .unwrap();
+        read_range(&Range::new(path.to_str().unwrap(), 5), &mut state, true)
+            .await
+            .unwrap();
         assert!(state.is_some());
         std::fs::remove_file(&path).unwrap();
         let _ = more(&mut state, 5).await.unwrap_err();

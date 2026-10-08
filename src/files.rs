@@ -35,24 +35,33 @@ pub const MAX_FILE_BYTES: usize = 16 * 1024 * 1024;
 /// extended-attribute calls.  And replacing a file is a *unit* — check what is there,
 /// write a temporary next to it, rename over the original — which is only safe if no
 /// other request interleaves with it.
-async fn blocking_io<T>(f: impl FnOnce() -> io::Result<T> + Send + 'static) -> io::Result<T>
+async fn blocking<T, E>(f: impl FnOnce() -> Result<T, E> + Send + 'static) -> Result<T, E>
 where
     T: Send + 'static,
+    E: NeverRan + Send + 'static,
 {
     tokio::task::spawn_blocking(f)
         .await
-        .unwrap_or_else(|err| Err(io::Error::other(did_not_finish(&err))))
+        .unwrap_or_else(|err| Err(E::never_ran(&did_not_finish(&err))))
 }
 
-async fn blocking_text<T>(
-    f: impl FnOnce() -> Result<T, String> + Send + 'static,
-) -> Result<T, String>
-where
-    T: Send + 'static,
-{
-    tokio::task::spawn_blocking(f)
-        .await
-        .unwrap_or_else(|err| Err(did_not_finish(&err)))
+/// What a blocking body reports when it never ran, in whichever error type the body
+/// already uses.  A file open answers with an errno and a tool answers with a sentence,
+/// and both have to say the same thing about a body that was never finished.
+trait NeverRan {
+    fn never_ran(reason: &str) -> Self;
+}
+
+impl NeverRan for String {
+    fn never_ran(reason: &str) -> Self {
+        reason.to_string()
+    }
+}
+
+impl NeverRan for io::Error {
+    fn never_ran(reason: &str) -> Self {
+        io::Error::other(reason)
+    }
 }
 
 /// A panic inside a blocking body, or a runtime torn down mid-write, becomes a failed
@@ -65,7 +74,7 @@ fn did_not_finish(err: &tokio::task::JoinError) -> String {
 /// device or a fifo would block the read tool forever, and a directory is not text.
 pub async fn open_regular(path: &str) -> io::Result<tokio::fs::File> {
     let path = path.to_string();
-    let file = blocking_io(move || open_regular_blocking(&path)).await?;
+    let file = blocking(move || open_regular_blocking(&path)).await?;
     Ok(tokio::fs::File::from_std(file))
 }
 
@@ -84,7 +93,7 @@ fn open_regular_blocking(path: &str) -> io::Result<File> {
 /// Reads a whole file, with the error wording the model is used to seeing.
 pub async fn read_bytes(path: &str) -> Result<Vec<u8>, String> {
     let path = path.to_string();
-    blocking_text(move || read_bytes_blocking(&path)).await
+    blocking(move || read_bytes_blocking(&path)).await
 }
 
 fn read_bytes_blocking(path: &str) -> Result<Vec<u8>, String> {
@@ -146,7 +155,7 @@ fn errno_message(code: i32) -> String {
 /// reading and writing is reported instead of silently overwritten.
 pub async fn replace(path: &str, data: Vec<u8>, expected: Option<Vec<u8>>) -> Result<(), String> {
     let path = path.to_string();
-    blocking_text(move || replace_blocking(&path, &data, expected.as_deref())).await
+    blocking(move || replace_blocking(&path, &data, expected.as_deref())).await
 }
 
 fn replace_blocking(path: &str, data: &[u8], expected: Option<&[u8]>) -> Result<(), String> {
