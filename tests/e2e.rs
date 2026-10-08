@@ -718,6 +718,32 @@ async fn a_frame_that_is_not_a_json_object_ends_the_session() {
     );
 }
 
+/// An id with a fraction is refused rather than rounded down, because answering it as
+/// the whole number would complete a request the agent never sent and would then be
+/// dropped by the agent as an answer to nothing.
+#[tokio::test]
+async fn a_frame_whose_id_is_not_an_integer_ends_the_session() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ds4-sandbox-helper"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start the helper");
+    let mut stdin = child.stdin.take().unwrap();
+    let payload = br#"{"id":7.9,"tool":"list"}"#;
+    stdin
+        .write_all(format!("{}\n", payload.len()).into_bytes().as_slice())
+        .await
+        .unwrap();
+    stdin.write_all(payload).await.unwrap();
+    stdin.flush().await.unwrap();
+    let status = child.wait().await.expect("wait");
+    assert!(
+        !status.success(),
+        "a request that cannot be answered by id must not exit clean"
+    );
+}
+
 /// `--chdir` is the only thing that says what a relative path means to this helper,
 /// so it has to hold for every tool that is given one.
 #[tokio::test]

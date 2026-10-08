@@ -87,6 +87,7 @@ impl Request {
 pub enum ProtocolError {
     NotAnObject,
     MissingId,
+    BadId,
     MissingTool,
 }
 
@@ -95,6 +96,7 @@ impl std::fmt::Display for ProtocolError {
         match self {
             ProtocolError::NotAnObject => write!(f, "frame payload is not a JSON object"),
             ProtocolError::MissingId => write!(f, "frame has no numeric id"),
+            ProtocolError::BadId => write!(f, "request id is not an integer"),
             ProtocolError::MissingTool => write!(f, "request has no tool name"),
         }
     }
@@ -108,16 +110,27 @@ pub fn parse_request(payload: &[u8]) -> Result<Request, ProtocolError> {
     let Value::Object(fields) = value else {
         return Err(ProtocolError::NotAnObject);
     };
+    // The id only has to come back unchanged, so a writer that prints 7.0 for the
+    // integer 7 means the same request.  A fraction is refused rather than truncated:
+    // answering 7.9 as 7 completes a request nobody made, and the sender drops the
+    // answer instead of guessing which request it was.
     let id = match fields.get("id") {
+        None => return Err(ProtocolError::MissingId),
         Some(Value::Number(n)) => n
             .as_i64()
-            .or_else(|| n.as_f64().map(|f| f as i64))
-            .ok_or(ProtocolError::MissingId)?,
-        _ => return Err(ProtocolError::MissingId),
+            .or_else(|| {
+                n.as_f64()
+                    .filter(|f| f.fract() == 0.0 && f.abs() < 9_223_372_036_854_775_808.0)
+                    .map(|f| f as i64)
+            })
+            .ok_or(ProtocolError::BadId)?,
+        Some(_) => return Err(ProtocolError::BadId),
     };
     let Some(Value::String(tool)) = fields.get("tool") else {
         return Err(ProtocolError::MissingTool);
     };
+    // An `args` of the wrong type is an empty one.  The tool answers with its own
+    // missing-parameter error, so a malformed member costs that call and not the session.
     let mut args = BTreeMap::new();
     if let Some(Value::Object(given)) = fields.get("args") {
         for (key, value) in given {
@@ -196,13 +209,13 @@ mod tests {
     }
 
     #[test]
-    fn a_number_is_not_an_id_and_an_object_is_not_a_frame() {
+    fn an_absent_id_and_a_non_object_frame_end_the_session() {
         assert!(matches!(
-            parse_request(br#"{"id":"7","tool":"read"}"#),
+            parse_request(br#"{"tool":"read"}"#),
             Err(ProtocolError::MissingId)
         ));
         assert!(matches!(
-            parse_request(br#"{"tool":"read"}"#),
+            parse_request(br#"{}"#),
             Err(ProtocolError::MissingId)
         ));
         assert!(matches!(
@@ -210,13 +223,40 @@ mod tests {
             Err(ProtocolError::NotAnObject)
         ));
         assert!(matches!(
-            parse_request(br#"{}"#),
-            Err(ProtocolError::MissingId)
-        ));
-        assert!(matches!(
             parse_request(br#"not json"#),
             Err(ProtocolError::NotAnObject)
         ));
+    }
+
+    #[test]
+    fn an_id_that_is_not_an_integer_is_refused_rather_than_renamed() {
+        // A writer that prints 7.0 for the integer 7 means the same request.
+        let req = parse_request(br#"{"id":7.0,"tool":"list"}"#).unwrap();
+        assert_eq!(req.id, 7);
+        // 7.9 would be answered as request 7, which nobody asked for.
+        assert!(matches!(
+            parse_request(br#"{"id":7.9,"tool":"list"}"#),
+            Err(ProtocolError::BadId)
+        ));
+        assert!(matches!(
+            parse_request(br#"{"id":"7","tool":"list"}"#),
+            Err(ProtocolError::BadId)
+        ));
+        assert!(matches!(
+            parse_request(br#"{"id":null,"tool":"list"}"#),
+            Err(ProtocolError::BadId)
+        ));
+        assert!(matches!(
+            parse_request(br#"{"id":1e30,"tool":"list"}"#),
+            Err(ProtocolError::BadId)
+        ));
+    }
+
+    #[test]
+    fn args_that_is_not_an_object_costs_one_call_and_not_the_session() {
+        let req = parse_request(br#"{"id":1,"tool":"read","args":"src/main.rs"}"#).unwrap();
+        assert!(req.args.is_empty());
+        assert_eq!(req.arg("path"), None);
     }
 
     #[test]
@@ -302,6 +342,12 @@ mod tests {
             parse(r#"{"id":1,"tool":"read","limits":{"read_lines":"60"},"args":{}}"#)
                 .read_lines_or(120),
             60
+        );
+        // A cap the sender's JSON wrote as a float is the same number of lines.
+        assert_eq!(
+            parse(r#"{"id":1,"tool":"read","limits":{"read_lines":240.0},"args":{}}"#)
+                .read_lines_or(120),
+            240
         );
         // An unknown cap, and a limits object that is not one, are both ignored.
         assert_eq!(
