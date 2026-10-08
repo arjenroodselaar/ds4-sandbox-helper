@@ -121,16 +121,22 @@ pub fn err_message(err: &io::Error) -> String {
     }
 }
 
-/// `strerror(3)` without pulling the C string through the formatter twice.
+/// Read `strerror_r(3)` into a buffer owned by the caller since `strerror(3)` is
+/// marked `MT-Unsafe` and this may be called by several `spawn_blocking` workers
+/// at once.
 fn errno_message(code: i32) -> String {
-    let bytes = unsafe {
-        let text = libc::strerror(code);
-        if text.is_null() {
+    // 256 is what POSIX asks `strerror_r` to be able to write.  Shorter asks for an
+    // `ERANGE` answer that says less to the model than the words would have.
+    let mut buf = [0u8; 256];
+    let text = unsafe {
+        // The `libc` crate binds the XSI variant everywhere, so this is the one that
+        // answers with a status rather than with a pointer that may not be `buf`.
+        if libc::strerror_r(code, buf.as_mut_ptr().cast(), buf.len()) != 0 {
             return format!("errno {code}");
         }
-        std::ffi::CStr::from_ptr(text)
+        std::ffi::CStr::from_ptr(buf.as_ptr().cast())
     };
-    bytes.to_string_lossy().into_owned()
+    text.to_string_lossy().into_owned()
 }
 
 /// Writes `data` to `path`, replacing it atomically.
@@ -495,6 +501,40 @@ mod tests {
         assert_eq!(line_spans(b""), Vec::<(usize, usize)>::new());
         assert_eq!(line_for_offset(&line_spans(b"a\nb\nc"), 3), 2);
         assert_eq!(line_for_offset(&line_spans(b"a\nb\nc"), 4), 3);
+    }
+
+    /// The words have to be the C library's own, because that is what the agent prints
+    /// for the same failure.  `Display` for an os error says the same thing and then
+    /// adds the number, so it is the oracle for the words without the suffix.
+    #[test]
+    fn an_errno_gets_the_c_librarys_own_words() {
+        for code in [
+            libc::ENOENT,
+            libc::EACCES,
+            libc::ENOTDIR,
+            libc::ELOOP,
+            libc::ENOSPC,
+        ] {
+            let said = errno_message(code);
+            let suffix = format!(" (os error {code})");
+            let expected = std::io::Error::from_raw_os_error(code)
+                .to_string()
+                .strip_suffix(suffix.as_str())
+                .unwrap_or_else(|| panic!("std said something else: {said}"))
+                .to_string();
+            assert_eq!(said, expected);
+            assert!(!said.contains("os error"), "{said}");
+        }
+        // The one almost every tool ends up saying, written out so a change to it is a
+        // decision rather than a surprise.
+        assert_eq!(errno_message(libc::ENOENT), "No such file or directory");
+    }
+
+    /// A number the C library has no words for still has to say something the model can
+    /// quote back.
+    #[test]
+    fn an_errno_with_no_words_gives_its_number() {
+        assert_eq!(errno_message(65_000), "errno 65000");
     }
 
     #[test]
