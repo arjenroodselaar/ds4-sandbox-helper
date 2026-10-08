@@ -669,6 +669,32 @@ async fn garbage_on_stdin_ends_the_session_with_a_reason() {
     assert!(!status.success(), "a garbage frame must not exit clean");
 }
 
+/// A frame counted at more bytes than the helper accepts is still a frame it has to
+/// count out, and a peer that stops in the middle of that has not ended the session.
+/// Counting a payload out has no buffer that can come up short, which is how this used
+/// to read as a clean close.
+#[tokio::test]
+async fn an_oversized_frame_that_stops_short_ends_the_session_with_a_reason() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ds4-sandbox-helper"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start the helper");
+    let mut stdin = child.stdin.take().unwrap();
+    // Over the request limit, so the helper counts this one out rather than parsing it,
+    // and far short of the count it was given.
+    stdin.write_all(b"2000013\nfour").await.unwrap();
+    stdin.flush().await.unwrap();
+    // Dropping the write end is the EOF in the middle of those counted bytes.
+    drop(stdin);
+    let output = child.wait_with_output().await.expect("wait");
+    assert_eq!(output.status.code(), Some(1), "{:?}", output.status);
+    let text = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(text.contains("stream ended after"), "{text}");
+    assert!(text.contains("of 2000013 payload bytes"), "{text}");
+}
+
 #[tokio::test]
 async fn a_frame_that_is_not_a_json_object_ends_the_session() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_ds4-sandbox-helper"))

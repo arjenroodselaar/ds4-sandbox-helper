@@ -76,7 +76,7 @@ where
         env!("CARGO_PKG_VERSION"),
         startup_details(&config)
     ));
-    if write(&mut writer, &startup).await.is_err() {
+    if wire::write_frame(&mut writer, &startup).await.is_err() {
         session.finish().await;
         return Outcome::Finished;
     }
@@ -113,7 +113,7 @@ where
             Frame::Payload(payload) => payload,
             Frame::Skipped { declared } => {
                 // No id to answer to, so say what happened and stay byte-aligned.
-                let _ = write(
+                let _ = wire::write_frame(
                     &mut writer,
                     &notice(&format!(
                         "request of {declared} bytes exceeds the {MAX_REQUEST_BYTES} byte limit and was dropped"
@@ -150,7 +150,7 @@ where
             reply
         };
 
-        if let Err(err) = write(&mut writer, &reply).await {
+        if let Err(err) = wire::write_frame(&mut writer, &reply).await {
             session.finish().await;
             // The agent exits when the run ends, so a last answer can meet EPIPE.
             return if err.kind() == ErrorKind::BrokenPipe {
@@ -160,13 +160,6 @@ where
             };
         }
     }
-}
-
-async fn write<W>(writer: &mut W, payload: &[u8]) -> std::io::Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    wire::write_frame(writer, payload).await
 }
 
 /// Waits for the agent's teardown signal.  There is nothing to read out of it, since
