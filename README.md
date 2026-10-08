@@ -30,7 +30,7 @@ The first frame is the helper's own, written before a byte of a request is read:
 
 ```
 149
-{"id":0,"text":"ds4-sandbox-helper 0.1.2 ready: dir /home/ds4-sandbox-helper, shell /bin/bash, read_lines default 120, upto marker off","type":"log"}
+{"id":0,"text":"ds4-sandbox-helper 0.1.3 ready: dir /home/ds4-sandbox-helper, shell /bin/bash, read_lines default 120, upto marker off","type":"log"}
 ```
 
 The word `ready` is what the agent blocks on, and it blocks before loading a
@@ -172,7 +172,16 @@ the temp directory. A leftover from either program therefore says the same thing
 to whoever finds it. What becomes of them is `tempfile`'s decision. A replace
 temporary that never reached its rename deletes itself, while the spool file is
 handed over to the job, because the model is shown its path and reads it back
-after the command is gone.
+after the command is gone. A command that cannot write is left to report it in
+its own words. The spool file is both its stdout and its stderr, so a full disk
+usually arrives as the command's own complaint in that file with a non-zero exit
+status, and that is what the model is shown. The helper adds a note of its own
+only when it could not wait for the command at all. Nothing hunts for leftovers
+at startup. A helper that swept the temp directory on the way in would delete
+the spool file a second helper is still handing to its model, and two sessions
+in one container are a reasonable thing to run. Leftovers are the boundary's
+job, which is the same thing that reaps a helper killed outright and the
+commands it started.
 
 ## How much of this is a port
 
