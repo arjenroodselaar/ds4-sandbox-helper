@@ -1,11 +1,11 @@
 # ds4-sandbox-helper
 
 The sandbox helper for [`ds4-agent --sandbox`](../ds4/docs/SANDBOX.md).
-`ds4-agent` can run with no filesystem or shell access of its own: it sends
+`ds4-agent` can run with no filesystem or shell access of its own. It sends
 every tool call over a pair of pipes and this program answers them. What the
-agent may touch is then whatever this program runs inside — a container, a VM, a
-chroot, a remote host — and the agent binary itself never needs the paths
-involved to exist.
+agent may touch is then whatever this program runs inside: a container, a VM, a
+chroot, a remote host. The agent binary itself never needs the paths involved to
+exist.
 
 It answers the framed protocol on stdin and stdout, and writes nothing but
 frames to stdout. Diagnostics, and the output of the commands it runs, go to
@@ -60,8 +60,8 @@ agent waiting for as long as the process lives.
 `--read-lines N` is the fallback for how many lines a bare `read` or `more`
 returns. The agent sends the real number with every request
 (`limits.read_lines`), because it is the one that knows the model's context
-size; this is what is used when a request does not say, which in practice means
-a person at a terminal.
+size. It is what is used when a request does not say, which in practice means a
+person at a terminal.
 
 `--edit-upto` accepts an `[upto]` marker in `edit`'s `old` text, which selects
 everything between two anchors. It can delete a great deal at once, so it is
@@ -74,22 +74,22 @@ what the model meant. If not available the helper falls back to `/bin/sh` which
 is assumed to be available in the sandbox. The sandbox startup notice reports
 which shell has been selected. An absolute path is checked before the first
 frame with errors reported on stderr and status 1 . A path without a slash is
-left for `PATH` to resolve when the command runs; checking it here would mean
+left for `PATH` to resolve when the command runs. Checking it here would mean
 answering the same question twice, and a wrong answer refuses a shell that
 works.
 
-`--chdir DIR` works in `DIR` instead: every relative path in a request, and the
+`--chdir DIR` works in `DIR` instead. Every relative path in a request, and the
 directory `bash` starts a command in, resolve there. It happens before the first
 frame is read, so nothing is ever answered from somewhere else. The same flag
-and the same complaints as `ds4-agent --chdir`. No environment variable: a
-directory inherited through one would be entered twice over for a helper the
-agent had already moved, and a relative one would then mean somewhere else
-entirely.
+and the same complaints as `ds4-agent --chdir`. There is no environment
+variable for it, because a directory inherited through one would be entered
+twice over for a helper the agent had already moved, and a relative one would
+then mean somewhere else entirely.
 
 The first three also read the matching environment variable, which is easier
 than quoting them through a container's `-e`. `--help` lists all four with their
-defaults, and a value that does not parse — on the command line or in the
-environment — stops the helper with usage on stderr rather than being quietly
+defaults. A value that does not parse, on the command line or in the
+environment, stops the helper with usage on stderr rather than being quietly
 ignored. A `--chdir` that cannot be done and a `--shell` that cannot be run are
 a different kind of mistake, and get the agent's own words for it:
 `invalid working directory …`, `… is not a directory`, `invalid shell …`,
@@ -102,28 +102,38 @@ on stdout.
 `bash_stop`.
 
 The answers are the same text the agent produces when it runs these tools
-itself, line numbers and all: a model should not have to know which side of the
+itself, line numbers and all. A model should not have to know which side of the
 pipe it is talking to. `bash` keeps jobs running in the background the way the
 agent does, with the same `bash_status` and `bash_stop` follow-ups, and a
 command that will not stop when told is killed along with its process group at
 the end of its deadline. A job also outlives neither the session nor its own
-group: when the run ends, by a closed stdin or by the agent's teardown signal,
+group. When the run ends, by a closed stdin or by the agent's teardown signal,
 whatever is still running is asked to stop, given a moment, and then killed
 along with its group, because the agent's signal stops at this process's group
 and a command started here runs in another one. `refresh_sec` on all three is
-how long the helper is allowed to take, not how long it takes: the answer goes
+how long the helper is allowed to take, not how long it takes. The answer goes
 out the moment the command finishes, and only a command still running at the
 deadline waits that long. A job finished by a signal reports `exit_status` as
 128+signal, so a stopped job reads as 143 or 137.
 
 A request carries with it the caps the helper cannot work out for itself, in a
 `limits` object of its own. The one today is `limits.read_lines`, the size a
-bare `read` or `more` should return: it follows the model's context window, and
+bare `read` or `more` should return. It follows the model's context window, and
 is capped at 500 here whatever the sender asks for. A limit this version does
 not know is ignored rather than rejected, which is the point of keeping them in
-an object of their own: another cap can be named later without changing the
+an object of their own. Another cap can be named later without changing the
 shape of a request. `--read-lines` is what a bare read means when the sender
 says nothing, which in practice means a person at a terminal.
+
+Time is bounded in one place. A `bash` command has `timeout_sec`, and a command
+that outlives it is killed along with its process group. Nothing else here runs
+against a clock. The file and search tools are bounded by size, by line count
+and by depth, and those caps keep an answer small enough to send. None of them
+says how long a call may take, so a call blocked on a wedged mount answers when
+the mount answers. A timer here could only give up on the call, and the blocked
+read would stay blocked. A deadline would buy a late answer, not a free mount.
+The container boundary is what ends such a call. The agent has no per-request
+deadline either, and the protocol spec records that as open.
 
 There is no path restriction in here. The helper does what it is asked, because
 it is meant to be the thing that runs inside a boundary that is enforced
@@ -146,20 +156,20 @@ its way out of it, which is the one thing the design has to avoid.
 
 Everything is async: the frame loop, the tools, the commands they start. The two
 things that genuinely cannot be async run on the blocking pool instead of the
-task — replacing a file, which is one sequence of open, temporary, copy of
-ownership and rename that has to stay a unit, and the odd open that needs flags
-Tokio's own options do not expose. Nothing blocks the runtime itself, which is
-what keeps a long `bash` job, a slow disk and a big `search` from holding each
-other up.
+task. One is replacing a file, which is one sequence of open, temporary, copy of
+ownership and rename that has to stay a unit. The other is the odd open that
+needs flags Tokio's own options do not expose. Nothing blocks the runtime
+itself, which is what keeps a long `bash` job, a slow disk and a big `search`
+from holding each other up.
 
 ## Temporary files
 
 Two files are made on the fly: the one an `edit` or a `write` is replaced
 through, and the one a `bash` command's output is spooled into. Both come from
-`tempfile`, and both keep the names the C agent gives its own —
+`tempfile`, and both keep the names the C agent gives its own:
 `<name>.ds4-XXXXXX` beside the file being replaced, `ds4_agent_output_XXXXXX` in
-the temp directory — so a leftover from either program says the same thing to
-whoever finds it. `tempfile` also decides what becomes of them: a replace
+the temp directory. A leftover from either program therefore says the same thing
+to whoever finds it. What becomes of them is `tempfile`'s decision. A replace
 temporary that never reached its rename deletes itself, while the spool file is
 handed over to the job, because the model is shown its path and reads it back
 after the command is gone.
@@ -169,7 +179,7 @@ after the command is gone.
 The behaviour is a faithful re-reading of the tool implementations in
 `ds4_agent.c`, including the wording of the messages, which matters because the
 model sees them and has learned what they mean. Where the C code and the spec
-doc disagree, the C code wins: it is what models have been tuned against, and it
+doc disagree, the C code wins. It is what models have been tuned against, and it
 is what the tests in this repo are checked against.
 
 Idiomatic Rust is used wherever it does not change an answer. Two places are
@@ -182,22 +192,22 @@ surprise:
   supported.
 - Answers that hit the byte ceiling carry a note saying the output was
   truncated. The agent cuts its own tool output silently, because it knows the
-  model can ask again; a helper that cut silently would leave a model wondering
+  model can ask again. A helper that cut silently would leave a model wondering
   whether the file simply ended there. `read` does not add the note, since it
   already ends with the offsets to resume from.
 
 ## Platforms
 
-macOS and Linux are both supported, and they differ in one place worth naming:
+macOS and Linux are both supported, and they differ in one place worth naming,
 the metadata that comes across when a file is replaced. macOS has a call that
 copies the rest of a file in one go, and it is used for the ACL and the extended
 attributes. Linux has no such call, but it keeps the POSIX ACL as an attribute
 of its own (`system.posix_acl_access`), so carrying the attributes across
-carries the ACL with them. Both are best effort: a label this process may not
-write — an SELinux context, a `trusted.*` attribute — is skipped, and the write
-still succeeds. A filesystem that will not hold attributes at all is not a
-failure of the write either, and the test that checks this quietly does nothing
-there.
+carries the ACL with them. Both are best effort. A label this process may not
+write is skipped, and the write still succeeds. An SELinux context and a
+`trusted.*` attribute are the usual ones. A filesystem that will not hold
+attributes at all is not a failure of the write either, and the test that checks
+this quietly does nothing there.
 
 ## Tests
 
