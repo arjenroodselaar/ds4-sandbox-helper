@@ -13,6 +13,10 @@
 //! subscribes to a watch channel instead of polling, so a finished job wakes whoever
 //! is waiting for it.  Output goes straight to the spool file rather than through a
 //! pipe, which is one fewer buffer that can fill and stall the command.
+//!
+//! A job outlives the request that started it, so the session ending is what ends it.
+//! The jobs run in process groups of their own, which the agent's teardown signal does
+//! not reach, so stopping them is the helper's own job.
 
 use std::fmt::Write;
 use std::io::SeekFrom;
@@ -47,6 +51,12 @@ const STOP_GRACE: Duration = Duration::from_secs(1);
 /// How long to wait for the reaper when `bash_stop` was not told how long to wait.
 /// It is a ceiling, not a delay.  The answer goes out the moment the job is reaped.
 const STOP_WAIT: Duration = Duration::from_secs(5);
+/// How long a running job is given to end on its own at session teardown.
+///
+/// Shorter than [`STOP_GRACE`].  The agent escalates its own teardown signal to
+/// SIGKILL one second after it closes stdin (`docs/SANDBOX.md`), so the teardown has
+/// to fit inside a second.  A job that needs longer is killed rather than waited out.
+const TEARDOWN_GRACE: Duration = Duration::from_millis(400);
 
 /// What the watcher task knows about a job, cloned into every observation.
 #[derive(Debug, Clone)]
@@ -180,6 +190,12 @@ pub async fn start(request: &Request, jobs: &mut Jobs, shell: &Path) -> Result<S
     let (sender, _receiver) = watch::channel(Status::default());
     let finished = sender.clone();
     tokio::spawn(async move {
+        // Dropping this task with the command still running is what happens when the
+        // runtime goes away at the end of a session, and `kill_on_drop` reaches the
+        // pid of the shell that exec'd the command rather than the group it leads.
+        // Disarmed once the child is reaped, because a pid is only safe to signal
+        // while it is still a process this helper is waiting for.
+        let mut reaper = GroupKill { pid, armed: true };
         let status =
             match tokio::time::timeout(Duration::from_secs_f64(timeout), child.wait()).await {
                 Ok(Ok(exit)) => Status {
@@ -212,6 +228,7 @@ pub async fn start(request: &Request, jobs: &mut Jobs, shell: &Path) -> Result<S
                     }
                 }
             };
+        reaper.disarm();
         let _ = finished.send(status);
     });
 
@@ -283,9 +300,39 @@ pub async fn stop(request: &Request, jobs: &mut Jobs) -> Result<String, String> 
     Ok(text)
 }
 
-/// Forgets every job and removes its spool file, for the session teardown path.
+/// Ends every job and removes its spool file, for the session teardown path.
+///
+/// A job is its own process group (see `start`), so the agent's teardown signal
+/// reaches this process and stops there.  Nothing but this stops a job, and a command
+/// the model started would otherwise outlive the session and keep writing into a file
+/// that has just been removed.
+///
+/// The escalation is the one a stop and a timeout use, with a shorter grace.  A job
+/// already reported finished is only forgotten, because its pid may belong to somebody
+/// else's group by now.  A group is only safe to signal while the leader that made it
+/// is still ours to wait for.
 pub async fn finish(jobs: &mut Jobs) {
+    let mut stopping = Vec::new();
     for job in jobs.list.drain(..) {
+        if !job.status().running {
+            let _ = tokio::fs::remove_file(&job.path).await;
+            continue;
+        }
+        kill_group(job.pid, libc::SIGTERM);
+        stopping.push(job);
+    }
+    if stopping.is_empty() {
+        return;
+    }
+    // One grace for the batch rather than one per job, so several wedged commands do
+    // not add up to several seconds of the teardown the agent is waiting out.
+    tokio::time::sleep(TEARDOWN_GRACE).await;
+    for job in stopping {
+        // The watcher is what reaps and updates the status, so still-running here
+        // means the group did not end within the grace.
+        if job.status().running {
+            kill_group(job.pid, libc::SIGKILL);
+        }
         let _ = tokio::fs::remove_file(&job.path).await;
     }
 }
@@ -425,6 +472,32 @@ fn kill_group(pid: u32, signal: i32) {
     }
     // Negative on purpose, so the whole group goes and not only the shell that exec'd.
     unsafe { libc::killpg(pid as i32, signal) };
+}
+
+/// Signals a job's process group when the watcher is dropped without reaping it.
+///
+/// `kill_on_drop` is a promise about the pid tokio spawned, and a job's children are
+/// in the group with it.  A drop is synchronous, so this still runs while the runtime
+/// is being torn down and nothing else async is left to run.
+struct GroupKill {
+    pid: u32,
+    armed: bool,
+}
+
+impl GroupKill {
+    /// Called once the child has been reaped, so a pid that has since been recycled
+    /// is never signalled.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for GroupKill {
+    fn drop(&mut self) {
+        if self.armed {
+            kill_group(self.pid, libc::SIGKILL);
+        }
+    }
 }
 
 /// Newlines plus one for a trailing partial line.  Streamed, because a command can

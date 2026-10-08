@@ -186,11 +186,20 @@ fn main() -> ExitCode {
         }
     };
 
-    match runtime.block_on(server::serve(
+    let outcome = runtime.block_on(server::serve(
         tokio::io::stdin(),
         tokio::io::stdout(),
         config,
-    )) {
+    ));
+
+    // Dropping a runtime waits for its blocking tasks, and the reader tokio puts on
+    // stdin keeps reading until the pipe ends.  A session ended by the agent's teardown
+    // signal rather than by a closed pipe would hang here until whoever holds the
+    // other end goes away.  Every answer is flushed with its own frame and the session
+    // teardown has run, so there is nothing left here worth waiting for.
+    runtime.shutdown_background();
+
+    match outcome {
         server::Outcome::Finished => ExitCode::SUCCESS,
         server::Outcome::Fault(reason) => {
             eprintln!("ds4-sandbox-helper: {reason}");

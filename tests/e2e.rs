@@ -866,3 +866,118 @@ async fn the_read_size_that_comes_with_the_request_wins() {
 
     helper.finish().await;
 }
+
+// --------------------------------------------------------------------------------
+// Session teardown.  A job runs in a process group of its own, which is what keeps a
+// runaway command from being able to hurt the helper, and what means the agent's
+// teardown signal stops at the helper's group.  Stopping the jobs is the helper's job.
+// --------------------------------------------------------------------------------
+
+/// Whether `pid` still has work to do.  A process that has died and not been reaped is
+/// a zombie, and a container whose pid 1 does not wait() leaves them lying about, so a
+/// zombie counts as dead here.  Signal 0 would have answered for it, and it has none.
+fn process_alive(pid: u32) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        // "pid (comm) state ...", and a command name can hold spaces and parentheses,
+        // so the fields that matter start after the last ')'.
+        Ok(stat) => stat
+            .rsplit_once(')')
+            .is_some_and(|(_, rest)| !rest.trim_start().starts_with('Z')),
+        Err(_) => false,
+    }
+}
+
+/// Waits for a killed process to stop.  Dying is not instant, and the poll is what
+/// keeps that from being a flake rather than a failure.
+async fn process_stopped(pid: u32, how: &str) {
+    let since = std::time::Instant::now();
+    while process_alive(pid) {
+        assert!(
+            since.elapsed() < std::time::Duration::from_secs(10),
+            "{how}: pid {pid} is still running"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// Starts a command with a child of its own, and returns the pid of that child with
+/// the spool file it shares with the shell.
+///
+/// The child is the point of the exercise.  It is in the job's group but not the pid
+/// the helper spawned, so it only dies if the group is taken down.  It reports itself
+/// before the shell waits, which tells a command that was killed apart from one that
+/// never got as far as forking.
+async fn job_with_a_child(helper: &mut Helper) -> (u32, String) {
+    let started = helper
+        .ok(
+            "bash",
+            serde_json::json!({"command": "sleep 120 & echo child=$!; wait", "refresh_sec": "0"}),
+        )
+        .await;
+    assert!(started.contains("status=running"), "{started}");
+    let spool = started
+        .lines()
+        .find_map(|line| line.strip_prefix("output_path="))
+        .and_then(|rest| rest.split(" (").next())
+        .expect("an output path")
+        .to_string();
+
+    let since = std::time::Instant::now();
+    let child = loop {
+        let text = std::fs::read_to_string(&spool).unwrap_or_default();
+        if let Some(rest) = text.strip_prefix("child=") {
+            break rest.trim().parse::<u32>().expect("a child pid");
+        }
+        assert!(
+            since.elapsed() < std::time::Duration::from_secs(10),
+            "the forked child never reported: {text}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
+    assert!(process_alive(child), "the child died on its own");
+    (child, spool)
+}
+
+/// The agent's teardown closes stdin and escalates to SIGKILL for the helper's group,
+/// so a job in a group of its own would be left running behind a dead helper, writing
+/// into a spool file that the teardown has already removed.
+#[tokio::test]
+async fn a_session_that_ends_takes_its_running_jobs_with_it() {
+    let mut helper = Helper::start(&[]).await;
+    let (child, spool) = job_with_a_child(&mut helper).await;
+
+    let status = helper.finish().await;
+    assert!(
+        status.success(),
+        "the helper left through EOF badly: {status}"
+    );
+    process_stopped(child, "after the session ended").await;
+    assert!(
+        !std::path::Path::new(&spool).exists(),
+        "spool file left behind: {spool}"
+    );
+}
+
+/// The same teardown asked for with a signal instead of the closed stdin that usually
+/// precedes it.  Dying on the spot would end the helper before it had stopped anything,
+/// so the signal is a request to finish, and the agent's SIGKILL stays the backstop.
+#[tokio::test]
+async fn a_helper_that_is_signalled_stops_its_jobs_too() {
+    let mut helper = Helper::start(&[]).await;
+    let (child, spool) = job_with_a_child(&mut helper).await;
+
+    let helper_pid = helper.child.id().expect("the helper has a pid");
+    // stdin stays open, so nothing but the signal can end the session.
+    unsafe { libc::kill(helper_pid as i32, libc::SIGTERM) };
+    let status = helper.child.wait().await.expect("wait for the helper");
+    assert!(
+        status.success(),
+        "the helper left through SIGTERM badly: {status}"
+    );
+
+    process_stopped(child, "after SIGTERM").await;
+    assert!(
+        !std::path::Path::new(&spool).exists(),
+        "spool file left behind: {spool}"
+    );
+}

@@ -7,6 +7,10 @@
 //! The agent keeps one request in flight, which is what lets this be a loop rather
 //! than a multiplexer.  The concurrency a long command needs lives inside the tool.
 //!
+//! Three things end the loop: stdin reaching EOF, a stream that has stopped making
+//! sense, and the agent's teardown signal.  All of them leave through the same session
+//! teardown, because the commands a session started are its own to stop.
+//!
 //! Anything unreadable ends the session instead of being worked around.  Byte counts
 //! that stopped agreeing with the peer cannot be answered without guessing.
 
@@ -16,6 +20,9 @@ use std::io::ErrorKind;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
 use tokio::io::BufReader;
+use tokio::signal::unix::Signal;
+use tokio::signal::unix::SignalKind;
+use tokio::signal::unix::signal;
 
 use crate::protocol;
 use crate::protocol::notice;
@@ -74,8 +81,23 @@ where
         return Outcome::Finished;
     }
 
+    // The agent's teardown closes stdin and then escalates SIGTERM to SIGKILL for this
+    // process's group.  The commands started here run in groups of their own, which
+    // that signal does not reach, so dying on it would leave them running behind the
+    // helper.  Answering it is what gives the teardown a chance to stop them.  A
+    // helper that cannot catch it keeps the default disposition, and the agent's
+    // SIGKILL stays the backstop.
+    let mut terminate = signal(SignalKind::terminate()).ok();
+
     loop {
-        let frame = match wire::read_frame(&mut reader, MAX_REQUEST_BYTES).await {
+        let received = tokio::select! {
+            _ = termination(&mut terminate) => {
+                session.finish().await;
+                return Outcome::Finished;
+            }
+            received = wire::read_frame(&mut reader, MAX_REQUEST_BYTES) => received,
+        };
+        let frame = match received {
             Ok(Some(frame)) => frame,
             Ok(None) => {
                 session.finish().await;
@@ -145,6 +167,21 @@ where
     W: AsyncWrite + Unpin,
 {
     wire::write_frame(writer, payload).await
+}
+
+/// Waits for the agent's teardown signal.  There is nothing to read out of it, since
+/// the arrival is the message, and the session ends the way it ends at a closed stdin.
+///
+/// A `None` means the signal could not be caught, which leaves the default disposition
+/// alone.  This never wakes then, and the closed stdin the agent signals after is what
+/// ends the session, as it would anyway.
+async fn termination(term: &mut Option<Signal>) {
+    match term {
+        Some(signal) => {
+            signal.recv().await;
+        }
+        None => std::future::pending::<()>().await,
+    }
 }
 
 /// The start of an unparsable request, quoted in the exit message.

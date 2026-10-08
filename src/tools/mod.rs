@@ -64,6 +64,10 @@ pub struct Session {
 }
 
 impl Session {
+    /// Ends the session.  Running commands are stopped, their spool files removed, and
+    /// the state a request cannot rebuild is dropped.  It is bounded work, because
+    /// whoever ended the session is waiting for this to return.  A command that will
+    /// not notice is killed rather than waited out.
     pub async fn finish(&mut self) {
         bash::finish(&mut self.jobs).await;
         self.more = None;

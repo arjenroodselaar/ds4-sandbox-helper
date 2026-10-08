@@ -106,11 +106,15 @@ itself, line numbers and all: a model should not have to know which side of the
 pipe it is talking to. `bash` keeps jobs running in the background the way the
 agent does, with the same `bash_status` and `bash_stop` follow-ups, and a
 command that will not stop when told is killed along with its process group at
-the end of its deadline. `refresh_sec` on all three is how long the helper is
-allowed to take, not how long it takes: the answer goes out the moment the
-command finishes, and only a command still running at the deadline waits that
-long. A job finished by a signal reports `exit_status` as 128+signal, so a
-stopped job reads as 143 or 137.
+the end of its deadline. A job also outlives neither the session nor its own
+group: when the run ends, by a closed stdin or by the agent's teardown signal,
+whatever is still running is asked to stop, given a moment, and then killed
+along with its group, because the agent's signal stops at this process's group
+and a command started here runs in another one. `refresh_sec` on all three is
+how long the helper is allowed to take, not how long it takes: the answer goes
+out the moment the command finishes, and only a command still running at the
+deadline waits that long. A job finished by a signal reports `exit_status` as
+128+signal, so a stopped job reads as 143 or 137.
 
 A request carries with it the caps the helper cannot work out for itself, in a
 `limits` object of its own. The one today is `limits.read_lines`, the size a
