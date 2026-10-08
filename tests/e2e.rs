@@ -970,6 +970,191 @@ async fn output_that_cannot_be_read_back_is_not_reported_as_empty() {
     helper.finish().await;
 }
 
+/// Reads one field out of a job header line.
+fn job_field(text: &str, key: &str) -> String {
+    text.split(key)
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .unwrap_or_else(|| panic!("no {key} in a job report: {text}"))
+        .to_string()
+}
+
+/// The output of a finished command is the answer until it passes the excerpt cap, and
+/// then the answer is the file and the head of it.  The size decides, not the line
+/// count, so the command here writes one very long line.
+#[tokio::test]
+async fn a_finished_command_with_a_large_output_is_answered_with_the_file() {
+    let mut helper = Helper::start(&[]).await;
+    let text = helper
+        .ok(
+            "bash",
+            serde_json::json!({"command": "head -c 12000 /dev/zero | tr '\\0' 'x'"}),
+        )
+        .await;
+    assert!(text.contains("status=done"), "{text}");
+    assert!(text.contains("(12000 bytes, 1 lines)"), "{text}");
+    assert!(!text.contains("<output>"), "{text}");
+    assert!(text.contains("<head -100 "), "{text}");
+
+    let head: String = text
+        .lines()
+        .skip_while(|line| !line.starts_with("<head -100 "))
+        .skip(1)
+        .take_while(|line| *line != "</head>")
+        .collect::<Vec<_>>()
+        .join("\n");
+    // The excerpt stops at the cap, mid-line.
+    assert_eq!(
+        head.len(),
+        8192,
+        "the excerpt is {} bytes rather than the cap",
+        head.len()
+    );
+    assert!(head.chars().all(|c| c == 'x'), "{head}");
+
+    helper.finish().await;
+}
+
+/// `refresh_sec` on a status asks the helper to wait for the command to end rather than
+/// answer that it is still running.
+#[tokio::test]
+async fn a_status_that_is_asked_to_wait_answers_with_the_finished_job() {
+    let mut helper = Helper::start(&[]).await;
+    // Long enough to outlast the first answer, so the wait is what sees the job end.
+    let started = helper
+        .ok(
+            "bash",
+            serde_json::json!({"command": "sleep 2; echo waited", "refresh_sec": "0"}),
+        )
+        .await;
+    assert!(started.contains("status=running"), "{started}");
+    let job = job_field(&started, "job=");
+
+    let began = std::time::Instant::now();
+    let later = helper
+        .ok(
+            "bash_status",
+            serde_json::json!({"job": job, "refresh_sec": "30"}),
+        )
+        .await;
+    // A status that ignored the wait would have answered "running" at once.
+    assert!(later.contains("status=done"), "{later}");
+    assert!(began.elapsed().as_secs_f64() >= 0.5, "{later}");
+
+    // The follow-up is the tail of the file rather than the output all over again.
+    assert!(later.contains("waited"), "{later}");
+    assert!(later.contains("<tail -20 "), "{later}");
+    assert!(!later.contains("<output>"), "{later}");
+
+    helper.finish().await;
+}
+
+/// A command that ends while no request is watching it still has to be reported as
+/// ended.  Its status arrives with no receiver, and the next ask has to see it.
+#[tokio::test]
+async fn a_command_that_ends_while_nobody_is_asking_is_still_reported_finished() {
+    let mut helper = Helper::start(&[]).await;
+    let started = helper
+        .ok(
+            "bash",
+            serde_json::json!({"command": "sleep 1.5; echo later", "refresh_sec": "0"}),
+        )
+        .await;
+    assert!(started.contains("status=running"), "{started}");
+    let job = job_field(&started, "job=");
+
+    // Long enough for the command to finish with no request outstanding on it.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+    let later = helper
+        .ok("bash_status", serde_json::json!({"job": job}))
+        .await;
+    assert!(later.contains("status=done"), "{later}");
+    assert!(later.contains("exit_status=0"), "{later}");
+    assert!(later.contains("later"), "{later}");
+
+    helper.finish().await;
+}
+
+/// A job can be named by the pid its header reports, for a caller holding a pid and not
+/// a job number.
+#[tokio::test]
+async fn a_job_can_be_named_by_its_process_id() {
+    let mut helper = Helper::start(&[]).await;
+    let one = helper
+        .ok(
+            "bash",
+            serde_json::json!({"command": "echo one; sleep 30", "refresh_sec": "0"}),
+        )
+        .await;
+    let two = helper
+        .ok(
+            "bash",
+            serde_json::json!({"command": "echo two; sleep 30", "refresh_sec": "0"}),
+        )
+        .await;
+    let (job_one, pid_one) = (job_field(&one, "job="), job_field(&one, "pid="));
+    let (job_two, pid_two) = (job_field(&two, "job="), job_field(&two, "pid="));
+    assert_ne!(pid_one, pid_two, "two jobs should not share a pid");
+
+    // Two jobs are running, so a pid that matched the wrong one would still answer.
+    let by_pid = helper
+        .ok("bash_status", serde_json::json!({"pid": pid_one}))
+        .await;
+    assert_eq!(job_field(&by_pid, "job="), job_one, "{by_pid}");
+
+    let stopped = helper
+        .ok("bash_stop", serde_json::json!({"pid": pid_two}))
+        .await;
+    assert_eq!(job_field(&stopped, "job="), job_two, "{stopped}");
+    assert!(stopped.contains("exit_status=143"), "{stopped}");
+
+    // A stopped job is forgotten whatever it was named by, and a pid is no handle once
+    // the job has been reaped.
+    let gone = helper
+        .fail("bash_status", serde_json::json!({"pid": pid_two}))
+        .await;
+    assert!(gone.contains("bash job not found"), "{gone}");
+
+    // Forgetting the job takes its spool file with it.
+    let spool = stopped
+        .lines()
+        .find_map(|line| line.strip_prefix("output_path="))
+        .and_then(|rest| rest.split(" (").next())
+        .expect("an output path");
+    assert!(
+        !std::path::Path::new(spool).exists(),
+        "{spool} was left behind"
+    );
+
+    helper.finish().await;
+}
+
+/// A timeout that does not parse is dropped for the default rather than guessed at, and
+/// a huge one is clamped, so every job has an end to it.
+#[tokio::test]
+async fn a_timeout_that_is_not_a_number_or_is_huge_still_bounds_the_job() {
+    let mut helper = Helper::start(&[]).await;
+
+    for (asked, expected) in [
+        ("soon", "timeout_sec=3600"),
+        ("0", "timeout_sec=3600"),
+        ("-5", "timeout_sec=3600"),
+        ("999999999", "timeout_sec=86400"),
+    ] {
+        let text = helper
+            .ok(
+                "bash",
+                serde_json::json!({"command": "sleep 30", "timeout_sec": asked, "refresh_sec": "0"}),
+            )
+            .await;
+        assert!(text.contains("status=running"), "{asked}: {text}");
+        assert!(text.contains(expected), "{asked}: {text}");
+    }
+
+    helper.finish().await;
+}
+
 // --------------------------------------------------------------------------------
 // Session teardown.  A job runs in a process group of its own, which is what keeps a
 // runaway command from being able to hurt the helper, and what means the agent's

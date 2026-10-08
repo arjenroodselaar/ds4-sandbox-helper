@@ -226,7 +226,10 @@ pub async fn start(request: &Request, jobs: &mut Jobs, shell: &Path) -> Result<S
                 }
             };
         reaper.disarm();
-        let _ = finished.send(status);
+        // `send` drops the value when no receiver exists, which is the usual case for a
+        // command that outlives the request that started it.  The status has to be
+        // recorded either way, or a finished job reads as running for the session.
+        finished.send_replace(status);
     });
 
     jobs.list.push(Job {
@@ -258,9 +261,12 @@ pub async fn status_tool(request: &Request, jobs: &mut Jobs) -> Result<String, S
     if refresh > 0 {
         wait_for(&mut jobs.list[index], Duration::from_secs(refresh)).await;
     }
+    // A caller that named the job by pid asked for no job number.  Removing by that
+    // number would leave the finished job on the list and its spool file on the disk.
+    let found = jobs.list[index].id;
     let text = observation(&mut jobs.list[index]).await;
     if !jobs.list[index].status().is_running() {
-        jobs.remove(id).await;
+        jobs.remove(found).await;
     }
     Ok(text)
 }
@@ -290,9 +296,10 @@ pub async fn stop(request: &Request, jobs: &mut Jobs) -> Result<String, String> 
     // The reaper still has to notice, or the answer would say "running" for a process
     // that is already reaped.
     wait_for(&mut jobs.list[index], patience).await;
+    let found = jobs.list[index].id;
     let text = observation(&mut jobs.list[index]).await;
     if !jobs.list[index].status().is_running() {
-        jobs.remove(id).await;
+        jobs.remove(found).await;
     }
     Ok(text)
 }
@@ -612,23 +619,64 @@ async fn read_tail(file: &mut File, want: usize) -> String {
         }
     }
     let window = &window[..read];
-    // A fragment at the start of the window is not a line, so it is not shown.
-    let starts_partial = take < len && !window.starts_with(b"\n");
+    // The last newline ends a line rather than starting one.  Counting it shows one
+    // line fewer than the file holds, and a file of one line shows nothing.
+    let end = window.len() - usize::from(window.ends_with(b"\n"));
     let mut start = 0;
-    let mut seen = 0;
-    for index in (0..window.len()).rev() {
+    let mut separators = 0;
+    for index in (0..end).rev() {
         if window[index] != b'\n' {
             continue;
         }
-        seen += 1;
-        if starts_partial && seen == 1 {
-            continue;
-        }
-        if seen > want {
+        separators += 1;
+        // The last `want` lines start after the `want`-th separator from the end.
+        if separators >= want {
             start = index + 1;
             break;
         }
-        start = index + 1;
+    }
+    // A window from the middle of the file starts mid-line, and a fragment is not a
+    // line.  This only matters when the whole window is being shown.
+    if take < len && start == 0 {
+        start = match window.iter().position(|byte| *byte == b'\n') {
+            Some(index) => index + 1,
+            None => window.len(),
+        };
     }
     String::from_utf8_lossy(&window[start..]).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn tail_of(dir: &Path, text: &str, want: usize) -> String {
+        let path = dir.join("out");
+        tokio::fs::write(&path, text).await.unwrap();
+        let mut file = tokio::fs::File::open(&path).await.unwrap();
+        read_tail(&mut file, want).await
+    }
+
+    /// Up to `want` lines, and never fewer lines than the file holds.
+    #[tokio::test]
+    async fn the_tail_holds_the_lines_that_are_there() {
+        let dir = tempfile::TempDir::with_prefix("ds4-helper-tail-").unwrap();
+
+        assert_eq!(tail_of(dir.path(), "waited\n", 4).await, "waited\n");
+        assert_eq!(tail_of(dir.path(), "one\ntwo\n", 20).await, "one\ntwo\n");
+        assert_eq!(tail_of(dir.path(), "one\ntwo\n", 1).await, "two\n");
+        assert_eq!(tail_of(dir.path(), "1\n2\n3\n4\n5\n", 3).await, "3\n4\n5\n");
+        assert_eq!(tail_of(dir.path(), "one\ntwo", 1).await, "two");
+        assert_eq!(tail_of(dir.path(), "", 4).await, "");
+    }
+
+    /// A window read from the end of a long file starts in the middle of a line, and
+    /// that fragment is not shown.
+    #[tokio::test]
+    async fn a_partial_line_at_the_start_of_a_window_is_dropped() {
+        let dir = tempfile::TempDir::with_prefix("ds4-helper-longtail-").unwrap();
+        let padded = format!("{}\nlast\n", "y".repeat(40 * 1024));
+
+        assert_eq!(tail_of(dir.path(), &padded, 2).await, "last\n");
+    }
 }

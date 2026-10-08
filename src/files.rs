@@ -833,6 +833,59 @@ mod tests {
         assert!(matches!(err.raw_os_error(), Some(libc::EINVAL)));
     }
 
+    /// A plain open on a fifo with no writer waits for one that may never come, and
+    /// `O_NONBLOCK` is what stops that.  The open itself succeeds on a fifo, so the file
+    /// type is what refuses it.  The deadline makes a regression here fail rather than
+    /// hang.
+    #[tokio::test]
+    async fn a_fifo_with_no_writer_is_refused_rather_than_waited_for() {
+        let (path, _dir) = temp_path("fifo");
+        let c_path = std::ffi::CString::new(path.to_str().unwrap().to_owned()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+
+        let opened = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            open_regular(path.to_str().unwrap()),
+        )
+        .await;
+        let err = match opened {
+            Err(_) => panic!("opening a fifo with no writer waited for a writer"),
+            Ok(Ok(_)) => panic!("a fifo was taken for a regular file"),
+            Ok(Err(err)) => err,
+        };
+        assert_eq!(err.raw_os_error(), Some(libc::EINVAL), "{err}");
+    }
+
+    /// `/dev/null` opens without waiting and reads as nothing, so only the file type
+    /// stops it.
+    #[tokio::test]
+    async fn opening_a_device_for_reading_fails() {
+        let err = open_regular("/dev/null").await.unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EINVAL), "{err}");
+    }
+
+    /// The limit is on the whole file, so a file past it is refused before any of it is
+    /// kept, and one that fits exactly is read.  A sparse file counts its bytes without
+    /// writing them, which is what makes this cheap to test.
+    #[tokio::test]
+    async fn a_file_at_the_size_limit_is_read_and_one_beyond_is_not() {
+        let (path, _dir) = temp_path("size");
+        let spread = |len: u64| {
+            let file = std::fs::File::create(&path).unwrap();
+            file.set_len(len).unwrap();
+        };
+
+        spread(MAX_FILE_BYTES as u64);
+        read_bytes(path.to_str().unwrap())
+            .await
+            .expect("a file the size of the limit should be read");
+
+        spread(MAX_FILE_BYTES as u64 + 1);
+        let err = read_bytes(path.to_str().unwrap()).await.unwrap_err();
+        assert!(err.contains("too large"), "{err}");
+        assert!(err.contains(&MAX_FILE_BYTES.to_string()), "{err}");
+    }
+
     #[tokio::test]
     async fn error_messages_read_like_strerror() {
         let err = std::fs::File::open("/no/such/file/here").unwrap_err();
