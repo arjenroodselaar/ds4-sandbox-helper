@@ -16,7 +16,10 @@ pub const MAX_TOOL_BYTES: usize = 128 * 1024;
 /// Room kept free for the note, so the finished text still fits the limit.
 pub const NOTE_MARGIN: usize = 4096;
 
-const NOTE: &str = "\n[Output truncated at the tool byte limit. Narrow the request.]\n";
+/// The sentence every answer that hit its byte limit ends with.  A tool that builds its
+/// text somewhere other than the budget itself has to add this by hand.
+pub const TRUNCATION_NOTE: &str =
+    "\n[Output truncated at the tool byte limit. Narrow the request.]\n";
 
 /// A `String` that stops growing at its limit, through [`fmt::Write`].
 pub struct Budget {
@@ -53,7 +56,7 @@ impl Budget {
         if self.truncated {
             self.truncated = false;
             self.limit = usize::MAX;
-            let _ = self.write_str(NOTE);
+            let _ = self.write_str(TRUNCATION_NOTE);
         }
         self.text
     }
@@ -99,7 +102,7 @@ mod tests {
         write!(b, "more").unwrap();
         let text = b.into_string();
         assert!(text.starts_with("aaaaaaaaaaaaaaaa"), "{text}");
-        assert!(text.ends_with(NOTE), "{text}");
+        assert!(text.ends_with(TRUNCATION_NOTE), "{text}");
     }
 
     #[test]
@@ -109,7 +112,7 @@ mod tests {
         let text = b.into_string();
         // "a" + the 4-byte emoji fit exactly.  "bc" does not.
         assert!(text.starts_with("a😀"), "{}", text.escape_debug());
-        assert!(!text[NOTE.len()..].contains('b'));
+        assert!(!text[TRUNCATION_NOTE.len()..].contains('b'));
         assert!(std::str::from_utf8(text.as_bytes()).is_ok());
     }
 
@@ -117,7 +120,7 @@ mod tests {
     fn a_budget_that_never_fits_still_reports_the_note() {
         let mut b = Budget::new(1);
         write!(b, "{}", "x".repeat(200)).unwrap();
-        assert!(b.into_string().ends_with(NOTE));
+        assert!(b.into_string().ends_with(TRUNCATION_NOTE));
     }
 
     #[test]

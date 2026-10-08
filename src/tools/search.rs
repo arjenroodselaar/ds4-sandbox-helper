@@ -22,6 +22,7 @@ use regex::Regex;
 use regex::RegexBuilder;
 
 use crate::budget::Budget;
+use crate::budget::TRUNCATION_NOTE;
 use crate::files;
 use crate::protocol::Request;
 
@@ -127,6 +128,7 @@ pub async fn search(request: &Request) -> Result<String, String> {
 
     walk(&mut ctx, path, 0).await;
 
+    let truncated = ctx.out.truncated();
     let body = ctx.out.text().to_string();
     let mut out = String::new();
     if body.is_empty() {
@@ -150,6 +152,12 @@ pub async fn search(request: &Request) -> Result<String, String> {
             "\nSearch incomplete: {} skipped paths{limit}. {}\n",
             ctx.skipped, ctx.first_skip
         );
+    }
+    // A full budget stops the walk without counting anything as skipped.  Nothing above
+    // then says the answer is short.  The byte limit speaks last, which is the order the
+    // agent uses.
+    if truncated {
+        out.push_str(TRUNCATION_NOTE);
     }
     Ok(out)
 }
@@ -474,6 +482,16 @@ mod tests {
             .unwrap()
     }
 
+    /// The last 200 bytes of an answer, for a failing assertion.  A truncated answer is
+    /// the size of the whole limit, and the note that matters sits at the end of it.
+    fn end_of(text: &str) -> String {
+        let keep = text.len().saturating_sub(200);
+        let start = (keep..=text.len())
+            .find(|&index| text.is_char_boundary(index))
+            .unwrap_or(text.len());
+        text[start..].to_string()
+    }
+
     #[tokio::test]
     async fn matches_are_grouped_under_their_file_with_a_count_header() {
         let (root, _dir) = tree();
@@ -548,6 +566,58 @@ mod tests {
         assert!(text.starts_with("1 match shown\n\n"), "{text}");
         assert!(text.contains("Search incomplete:"), "{text}");
         assert!(text.contains("match limit reached"), "{text}");
+    }
+
+    /// A search can stop with nothing skipped and the match cap still far away, because
+    /// the answer filled up.  The cap note cannot fire in that case, so the byte limit
+    /// is the only thing that can say the answer is short.
+    #[tokio::test]
+    async fn an_answer_that_filled_the_budget_says_so_without_any_skip_or_cap() {
+        let (root, _dir) = tree();
+        // 5 000 matching lines of 500 bytes, against a 128 KiB answer.
+        let lines: String = (0..5_000)
+            .map(|_| format!("needle {}\n", "x".repeat(493)))
+            .collect();
+        std::fs::write(root.join("many.txt"), lines).unwrap();
+        let text = search(&request(&format!(
+            r#""query":"needle","path":"{}","max_results":"500""#,
+            root.display()
+        )))
+        .await
+        .unwrap();
+        assert!(text.ends_with(TRUNCATION_NOTE), "{}", end_of(&text));
+        assert!(!text.contains("Search incomplete"), "{text}");
+        // The note belongs to the answer, so the answer still fits the tool limit.
+        assert!(
+            text.len() <= crate::budget::MAX_TOOL_BYTES,
+            "{} bytes",
+            text.len()
+        );
+    }
+
+    /// Both notes at once, and in the order the agent puts them: what was left out
+    /// first, then the limit that cut the answer short.
+    #[tokio::test]
+    async fn the_limit_note_follows_the_incomplete_note_when_both_are_due() {
+        let (root, _dir) = tree();
+        // Six lines of 30 KiB.  The first match and its context alone are twice the
+        // answer budget, and one result is all the cap allows.
+        let wide = root.join("wide.txt");
+        let lines: String = (0..6)
+            .map(|_| format!("needle {}\n", "x".repeat(30_000)))
+            .collect();
+        std::fs::write(&wide, lines).unwrap();
+        let text = search(&request(&format!(
+            r#""query":"needle","path":"{}","context":"5","max_results":"1""#,
+            wide.display()
+        )))
+        .await
+        .unwrap();
+        assert!(text.contains("match limit reached"), "{}", end_of(&text));
+        assert!(text.ends_with(TRUNCATION_NOTE), "{}", end_of(&text));
+        let incomplete = text.find("Search incomplete").expect("incomplete note");
+        let limit = text.find("[Output truncated").expect("truncation note");
+        assert!(incomplete < limit, "{text}");
     }
 
     #[tokio::test]
