@@ -1,6 +1,6 @@
 [package]
 name = "ds4-sandbox-helper"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 rust-version = "1.85"
 description = "Sandbox-side tool runner for ds4-agent --sandbox: framed request/response protocol plus the read/write/edit/search/list/bash tools"
