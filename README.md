@@ -73,7 +73,7 @@ if available in the sandbox, so arrays, `[[ ]]` and process substitution mean
 what the model meant. If not available the helper falls back to `/bin/sh` which
 is assumed to be available in the sandbox. The sandbox startup notice reports
 which shell has been selected. An absolute path is checked before the first
-frame with errors reported on stderr and status 1 . A path without a slash is
+frame with errors reported on stderr and status 1. A path without a slash is
 left for `PATH` to resolve when the command runs. Checking it here would mean
 answering the same question twice, and a wrong answer refuses a shell that
 works.
@@ -271,3 +271,9 @@ cargo build --release
 HELPER=$PWD/target/release/ds4-sandbox-helper
 cd ../ds4 && DS4_SANDBOX_HELPER=$HELPER ./ds4_agent_test
 ```
+
+Neither of those looks at a transcript. `docs/probe_frames.py` starts a helper of its
+own and prints the frames it really sends, which is the only way to see what a model
+was actually given. `docs/EXIT_STATUS_PROBE.md` is the runbook for a report that
+`exit_status=` went missing from a `bash` answer, with the frames it captured and the
+steps to take the next time one appears.

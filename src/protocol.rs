@@ -5,9 +5,10 @@
 //! The two message shapes carried inside frames, and the strictness that goes
 //! with them.
 //!
-//! A frame is read for its `id` and its text.  Everything else is ignored so either
-//! side can grow.  A frame with no numeric `id`, or a response with no boolean `ok`,
-//! ends the session rather than being guessed at.
+//! A request is read for its `id`, its `tool`, its `args` and its `limits`.  Anything
+//! they do not name is ignored, so either side can grow.  A frame with no numeric
+//! `id`, or a response with no boolean `ok`, ends the session rather than being guessed
+//! at.
 
 use serde_json::Value;
 use serde_json::json;

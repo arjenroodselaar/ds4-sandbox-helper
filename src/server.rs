@@ -19,7 +19,9 @@
 //! waiting, answers, and the loop ends on its way back around.
 //!
 //! Anything unreadable ends the session instead of being worked around.  Byte counts
-//! that stopped agreeing with the peer cannot be answered without guessing.
+//! that stopped agreeing with the peer cannot be answered without guessing.  A request
+//! that is merely too big is the exception, because its size is the whole of what is
+//! wrong with it and nothing inside it has to be read to say so.
 
 use std::env::current_dir;
 use std::future::Future;
@@ -148,7 +150,10 @@ where
         let payload = match frame {
             Frame::Payload(payload) => payload,
             Frame::Skipped { declared } => {
-                // No id to answer to, so say what happened and stay byte-aligned.
+                // Nothing in a frame dropped for its size was read, so there is no id to
+                // answer with.  The notice keeps the stream aligned and is the last this
+                // peer hears.  A notice never completes a request, and no answer to a
+                // request that was never read is possible.
                 let _ = wire::write_frame(
                     &mut writer,
                     &notice(&format!(
