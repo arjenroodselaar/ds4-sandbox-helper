@@ -795,6 +795,10 @@ mod tests {
             .await
             .unwrap();
         file.write_all(text.as_bytes()).await.unwrap();
+        // `write_all` on a tokio file hands the bytes to a blocking task and returns
+        // before they reach the file.  The count that follows reads the same path, so
+        // an append that has not landed makes it disagree with a fresh read.
+        file.flush().await.unwrap();
     }
 
     async fn opened(path: &Path) -> File {

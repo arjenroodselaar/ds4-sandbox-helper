@@ -340,7 +340,7 @@ fn write_temp(target: &Path, data: &[u8], mode: u32) -> io::Result<NamedTempFile
 
 fn create_new(target: &Path, data: &[u8]) -> io::Result<NamedTempFile> {
     // 0o666 and let open() apply the umask, which is what a brand new file wants.
-    write_temp(target, data, 0o666)
+    seal(write_temp(target, data, 0o666)?)
 }
 
 /// Replaces an existing file keeping its owner and every bit of its mode, so an
@@ -356,8 +356,13 @@ fn copy_metadata(
     let owner = source.metadata().ok();
     let uid = owner.as_ref().map(MetadataExt::uid).unwrap_or(u32::MAX);
     let gid = owner.as_ref().map(MetadataExt::gid).unwrap_or(u32::MAX);
-    // Only root can hand ownership over.  Losing it is not worth losing the edit.
-    unsafe { libc::fchown(temp.as_raw_fd(), uid as libc::uid_t, gid as libc::gid_t) };
+    // The temporary belongs to whoever is editing, so the target's owner and group have
+    // to be handed over.  A caller may set a group only to one they belong to, and an
+    // ownership that cannot be claimed is worth refusing the edit over.  A metadata read
+    // that failed leaves `-1`, which `chown` takes as no change.
+    if unsafe { libc::fchown(temp.as_raw_fd(), uid as libc::uid_t, gid as libc::gid_t) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
 
     // Neither of the calls that made this file can carry the target's bits.  `open`
     // masks the mode it is handed with the umask, and a write drops the setuid and
@@ -388,7 +393,7 @@ fn copy_metadata(
         // rather than costing the edit.
         copy_xattrs(source.as_raw_fd(), temp.as_raw_fd());
     }
-    Ok(temp)
+    seal(temp)
 }
 
 /// Carries every extended attribute from one open file to another, skipping the ones
@@ -439,6 +444,15 @@ fn xattr_value(fd: std::os::fd::RawFd, name: &std::ffi::CString) -> Option<Vec<u
     }
     value.truncate(read as usize);
     Some(value)
+}
+
+/// Puts everything a replacement is made of onto the device before the name is
+/// published, which is what the agent's `fsync` does here on both paths.  The answer
+/// that says the bytes went in is a promise about the file, and a helper that never
+/// syncs is promising the page cache instead.
+fn seal(temp: NamedTempFile) -> io::Result<NamedTempFile> {
+    temp.as_file().sync_all()?;
+    Ok(temp)
 }
 
 /// Moves the temporary onto the target, which is what makes the replacement atomic,
@@ -910,6 +924,40 @@ mod tests {
             assert_eq!(got, mode, "a replacement of a file at {mode:o}");
             std::fs::remove_file(text).unwrap();
         }
+    }
+
+    /// The group is part of the ownership a replacement keeps.  A temporary is made with
+    /// the group of whoever is editing, so only the hand-over can put the target's group
+    /// back, and a replacement that drops it takes the file out of a group nobody asked
+    /// to leave.  Setting a foreign group is root's, so root is the uid that can check
+    /// the keeping in a test.
+    #[tokio::test]
+    async fn the_group_survives_a_replace() {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("cannot set a foreign group as a non-root caller, nothing to check");
+            return;
+        }
+        let (path, _dir) = temp_path("group");
+        let text = path.to_str().unwrap();
+        replace(text, b"one\n".to_vec(), None).await.unwrap();
+        // A group the temporary cannot arrive with.  `-1` leaves the owner alone.
+        let group = 1u32;
+        let name = std::ffi::CString::new(text).unwrap();
+        assert_eq!(
+            unsafe { libc::chown(name.as_ptr(), u32::MAX as libc::uid_t, group as libc::gid_t) },
+            0
+        );
+
+        replace(text, b"two\n".to_vec(), Some(b"one\n".to_vec()))
+            .await
+            .unwrap();
+        let meta = std::fs::metadata(text).unwrap();
+        assert_eq!(
+            MetadataExt::gid(&meta),
+            group,
+            "the group was not handed over"
+        );
+        std::fs::remove_file(text).unwrap();
     }
 
     #[tokio::test]
