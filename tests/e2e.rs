@@ -77,6 +77,9 @@ impl Helper {
             // Which shell a run with no option uses is a question about the sandbox,
             // not about whoever exported DS4_SHELL.
             .env_remove("DS4_SHELL")
+            // Same for the marker a command is told about, which has to come from the
+            // helper rather than from this test runner.
+            .env_remove("DS4_SANDBOX")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             // Diagnostics stay on the inherited stderr.  The agent's contract is that
@@ -570,6 +573,22 @@ async fn a_command_that_ignores_its_deadline_is_killed() {
         text.contains("exit_status=143") || text.contains("exit_status=137"),
         "{text}"
     );
+    helper.finish().await;
+}
+
+/// A command is told it is inside the sandbox, which is the only way a script can ask
+/// before doing something it would only do on a host.
+#[tokio::test]
+async fn a_command_is_told_it_is_in_the_sandbox() {
+    let mut helper = Helper::start(&[]).await;
+    let text = helper
+        .ok(
+            "bash",
+            serde_json::json!({"command": "echo sandbox=${DS4_SANDBOX:-unset}"}),
+        )
+        .await;
+    assert!(text.contains("sandbox=1"), "{text}");
+
     helper.finish().await;
 }
 

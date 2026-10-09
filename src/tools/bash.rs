@@ -248,6 +248,9 @@ pub async fn start(
         // The one flag every shell worth choosing understands.
         .arg("-c")
         .arg(command)
+        // Set here rather than inherited, so a command can ask where it is running
+        // whatever the launcher gave this helper.
+        .env("DS4_SANDBOX", "1")
         // The helper's stdin is the request stream.  A command must not eat a frame.
         .stdin(Stdio::null())
         // Plain descriptors, because the helper never reads them back.

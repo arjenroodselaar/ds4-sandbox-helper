@@ -169,6 +169,11 @@ it is meant to be the thing that runs inside a boundary that is enforced
 elsewhere. Putting a path jail in the helper would let a compromised agent talk
 its way out of it, which is the one thing the design has to avoid.
 
+Every command started here is given `DS4_SANDBOX=1` in its environment. The
+helper sets it rather than passing on whatever it was started with, so the
+marker says where the command is running instead of how the container was
+launched. A script that has no business running outside a sandbox can ask.
+
 ## Layout
 
 - `src/wire.rs` — The frame: a decimal byte count, a newline, that many bytes.
