@@ -123,11 +123,30 @@ fn read_bytes_blocking(path: &str) -> Result<Vec<u8>, String> {
 }
 
 /// The wording `strerror()` would have given, which is what the model has learned.
+/// A wrapper error such as `tempfile`'s keeps the kind of a failure, loses its errno,
+/// and adds the path it tried.  That path is a temporary the model never saw.
 pub fn err_message(err: &io::Error) -> String {
-    match err.raw_os_error() {
+    match err.raw_os_error().or_else(|| errno_of_kind(err.kind())) {
         Some(code) => errno_message(code),
         None => err.to_string(),
     }
+}
+
+/// The number a kind was made from.  Only the ones a file replacement can meet, so an
+/// unlisted kind keeps the message it arrived with.
+fn errno_of_kind(kind: io::ErrorKind) -> Option<i32> {
+    Some(match kind {
+        io::ErrorKind::NotFound => libc::ENOENT,
+        io::ErrorKind::PermissionDenied => libc::EACCES,
+        io::ErrorKind::AlreadyExists => libc::EEXIST,
+        io::ErrorKind::NotADirectory => libc::ENOTDIR,
+        io::ErrorKind::IsADirectory => libc::EISDIR,
+        io::ErrorKind::InvalidFilename => libc::ENAMETOOLONG,
+        io::ErrorKind::DirectoryNotEmpty => libc::ENOTEMPTY,
+        io::ErrorKind::StorageFull => libc::ENOSPC,
+        io::ErrorKind::ReadOnlyFilesystem => libc::EROFS,
+        _ => return None,
+    })
 }
 
 /// Read `strerror_r(3)` into a buffer owned by the caller since `strerror(3)` is
@@ -163,7 +182,7 @@ fn replace_blocking(path: &str, data: &[u8], expected: Option<&[u8]>) -> Result<
     let existing = match target.symlink_metadata() {
         Ok(meta) => Some(meta),
         Err(err) if err.kind() == io::ErrorKind::NotFound => None,
-        Err(err) => return Err(err_message(&err)),
+        Err(err) => return Err(failed(target, &err)),
     };
 
     // Nothing to clean up.  The temporary deletes itself on every path that did not
@@ -179,14 +198,14 @@ fn replace_inner(
 ) -> Result<(), String> {
     if existing.is_some() {
         // Resolve the name so the temporary lands next to the file.
-        let resolved = std::fs::canonicalize(target).map_err(|err| err_message(&err))?;
+        let resolved = std::fs::canonicalize(target).map_err(|err| failed(target, &err))?;
         let source = OpenOptions::new()
             .read(true)
             .write(true)
             .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(&resolved)
-            .map_err(|err| err_message(&err))?;
-        let source_meta = source.metadata().map_err(|err| err_message(&err))?;
+            .map_err(|err| failed(target, &err))?;
+        let source_meta = source.metadata().map_err(|err| failed(target, &err))?;
         if !source_meta.file_type().is_file() || source_meta.nlink() != 1 {
             return Err(format!(
                 "refusing to replace non-regular or hard-linked file: {}",
@@ -199,7 +218,8 @@ fn replace_inner(
         {
             return Err(changed(target));
         }
-        let temp = copy_metadata(&source, data, &resolved, mode)?;
+        let temp =
+            copy_metadata(&source, data, &resolved, mode).map_err(|err| failed(target, &err))?;
         // The last look before committing.  Matching bytes are not enough.  A writer
         // that replaced the file with identical content moved a different inode into
         // the name, and this edit would replace a file nobody had read.
@@ -208,14 +228,15 @@ fn replace_inner(
         }
         // Renamed onto the resolved name so the file is replaced in place and a symlink
         // to it keeps pointing at it, instead of becoming an ordinary file.
-        return rename(temp, &resolved);
+        return rename(temp, &resolved).map_err(|err| failed(target, &err));
     }
 
     if expected.is_some() {
         // The file the edit read is gone.  That is the same race, and the same answer.
         return Err(changed(target));
     }
-    link_new(create_new(target, data)?, target)
+    let temp = create_new(target, data).map_err(|err| failed(target, &err))?;
+    link_new(temp, target).map_err(|err| failed(target, &err))
 }
 
 /// What the agent says when the file is not the one the edit was worked out against.
@@ -227,7 +248,9 @@ fn changed(target: &Path) -> String {
     )
 }
 
-/// The agent's wording for a replacement the filesystem itself refused.
+/// The agent's wording for a replacement the filesystem itself refused.  Every such
+/// refusal is said here, with the path that was asked for.  A model can do nothing with
+/// the name of a temporary it never mentioned.
 fn failed(target: &Path, err: &io::Error) -> String {
     format!("replace {}: {}", target.display(), err_message(err))
 }
@@ -293,7 +316,7 @@ fn same_file_version(before: &Metadata, path: &Path) -> bool {
 /// before the rename.  The mode goes to `open` so a brand new file is umasked like any
 /// other new file.  A replacement sets its bits again afterwards, because the umask has
 /// no business changing the bits a file already had.
-fn temp_for(target: &Path, mode: u32) -> Result<NamedTempFile, String> {
+fn temp_for(target: &Path, mode: u32) -> io::Result<NamedTempFile> {
     let dir = match target.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
         _ => Path::new("."),
@@ -306,17 +329,16 @@ fn temp_for(target: &Path, mode: u32) -> Result<NamedTempFile, String> {
         .prefix(&format!("{name}.ds4-"))
         .permissions(std::fs::Permissions::from_mode(mode))
         .tempfile_in(dir)
-        .map_err(|err| err_message(&err))
 }
 
 /// A temporary holding the new bytes, with the mode the finished file should have.
-fn write_temp(target: &Path, data: &[u8], mode: u32) -> Result<NamedTempFile, String> {
+fn write_temp(target: &Path, data: &[u8], mode: u32) -> io::Result<NamedTempFile> {
     let mut temp = temp_for(target, mode)?;
-    temp.write_all(data).map_err(|err| err_message(&err))?;
+    temp.write_all(data)?;
     Ok(temp)
 }
 
-fn create_new(target: &Path, data: &[u8]) -> Result<NamedTempFile, String> {
+fn create_new(target: &Path, data: &[u8]) -> io::Result<NamedTempFile> {
     // 0o666 and let open() apply the umask, which is what a brand new file wants.
     write_temp(target, data, 0o666)
 }
@@ -328,7 +350,7 @@ fn copy_metadata(
     data: &[u8],
     target: &Path,
     mode: u32,
-) -> Result<NamedTempFile, String> {
+) -> io::Result<NamedTempFile> {
     let temp = write_temp(target, data, mode & 0o7777)?;
 
     let owner = source.metadata().ok();
@@ -342,8 +364,7 @@ fn copy_metadata(
     // setgid bits.  This is the one that can, and it comes after the write and the
     // ownership change because both of them clear the bits again.
     if unsafe { libc::fchmod(temp.as_raw_fd(), mode as libc::mode_t) } != 0 {
-        let err = std::io::Error::last_os_error();
-        return Err(failed(target, &err));
+        return Err(io::Error::last_os_error());
     }
 
     #[cfg(target_os = "macos")]
@@ -422,9 +443,8 @@ fn xattr_value(fd: std::os::fd::RawFd, name: &std::ffi::CString) -> Option<Vec<u
 
 /// Moves the temporary onto the target, which is what makes the replacement atomic,
 /// and takes it out of the destructor's reach on the way.
-fn rename(temp: NamedTempFile, target: &Path) -> Result<(), String> {
-    temp.persist(target)
-        .map_err(|err| failed(target, &err.error))?;
+fn rename(temp: NamedTempFile, target: &Path) -> io::Result<()> {
+    temp.persist(target).map_err(|err| err.error)?;
     Ok(())
 }
 
@@ -435,15 +455,15 @@ fn rename(temp: NamedTempFile, target: &Path) -> Result<(), String> {
 ///
 /// Where linking is unsupported — a FAT card, one FUSE mount out of several — the link
 /// is retried as a rename, because the race protection was never available there.
-fn link_new(temp: NamedTempFile, target: &Path) -> Result<(), String> {
+fn link_new(temp: NamedTempFile, target: &Path) -> io::Result<()> {
     if let Err(err) = std::fs::hard_link(temp.path(), target) {
         if !link_was_unsupported(&err) {
-            return Err(failed(target, &err));
+            return Err(err);
         }
         return rename(temp, target);
     }
     // Closing also unlinks the temporary's own name, and the target keeps the inode.
-    temp.close().map_err(|err| failed(target, &err))
+    temp.close()
 }
 
 /// The refusals that mean "this filesystem has no link operation", as opposed to
@@ -548,6 +568,48 @@ mod tests {
         // The one almost every tool ends up saying, written out so a change to it is a
         // decision rather than a surprise.
         assert_eq!(errno_message(libc::ENOENT), "No such file or directory");
+    }
+
+    /// Every refusal is worded the way the agent's own tool words it, with the path the
+    /// model wrote in it.  A temporary's name is nothing a model can act on, and a
+    /// resolved path is a different file from the one it named.
+    #[tokio::test]
+    async fn a_failed_replacement_names_the_path_that_was_asked_for() {
+        let (path, dir) = temp_path("wording");
+        std::fs::write(&path, b"one\n").unwrap();
+
+        // This is the failure that used to answer with a temporary's name.
+        let missing = dir.path().join("gone/file");
+        let missing = missing.to_str().unwrap().to_string();
+        assert_eq!(
+            replace(&missing, b"x".to_vec(), None).await.unwrap_err(),
+            format!("replace {missing}: No such file or directory")
+        );
+
+        // A name with a plain file where a directory has to be.
+        let through = path.join("deeper");
+        let through = through.to_str().unwrap().to_string();
+        assert_eq!(
+            replace(&through, b"x".to_vec(), None).await.unwrap_err(),
+            format!("replace {through}: Not a directory")
+        );
+
+        // A directory is not a file to replace.
+        let a_dir = dir.path().to_str().unwrap().to_string();
+        assert_eq!(
+            replace(&a_dir, b"x".to_vec(), None).await.unwrap_err(),
+            format!("replace {a_dir}: Is a directory")
+        );
+
+        // A name that points at nothing.
+        let gone = dir.path().join("gone");
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&gone, &link).unwrap();
+        let link = link.to_str().unwrap().to_string();
+        assert_eq!(
+            replace(&link, b"x".to_vec(), None).await.unwrap_err(),
+            format!("replace {link}: No such file or directory")
+        );
     }
 
     /// A number the C library has no words for still has to say something the model can
@@ -791,7 +853,7 @@ mod tests {
         std::fs::write(text, b"someone else got here first\n").unwrap();
 
         let err = link_new(temp, &path).unwrap_err();
-        assert!(err.contains("File exists"), "{err}");
+        assert_eq!(err.raw_os_error(), Some(libc::EEXIST), "{err}");
         assert_eq!(
             std::fs::read(text).unwrap(),
             b"someone else got here first\n"

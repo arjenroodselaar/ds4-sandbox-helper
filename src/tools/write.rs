@@ -64,10 +64,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_missing_directory_is_reported_not_panicked() {
+        // This is the agent's own wording, with the path it was given and not the
+        // temporary's.  The refusals that need an existing file are in `files.rs`.
         let err = write(&request(r#""path":"/no/such/dir/file","content":"x""#))
             .await
             .unwrap_err();
-        assert!(!err.is_empty());
+        assert_eq!(err, "replace /no/such/dir/file: No such file or directory");
         let err = write(&request(r#""content":"x""#)).await.unwrap_err();
         assert_eq!(err, "write requires path");
     }
