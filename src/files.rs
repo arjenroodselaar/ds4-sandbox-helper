@@ -245,11 +245,12 @@ fn same_contents(file: &File, wanted: &[u8]) -> bool {
     let mut buf = [0u8; 8192];
     loop {
         let want = std::cmp::min(buf.len(), wanted.len() - pos);
-        if want == 0 {
-            return true;
-        }
-        match file.read(&mut buf[..want]) {
-            Ok(0) => return false,
+        // Once `wanted` runs out the file has to run out at the same byte.  A file that
+        // merely starts with these bytes is a file that changed.
+        let room = if want == 0 { 1 } else { want };
+        match file.read(&mut buf[..room]) {
+            Ok(0) => return want == 0,
+            Ok(_) if want == 0 => return false,
             Ok(n) => {
                 if buf[..n] != wanted[pos..pos + n] {
                     return false;
@@ -648,6 +649,50 @@ mod tests {
         );
         assert_eq!(std::fs::read(text).unwrap(), b"original");
         replace(text, b"edited".to_vec(), Some(b"original".to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(text).unwrap(), b"edited");
+        std::fs::remove_file(text).unwrap();
+    }
+
+    /// The guard is about the whole file.  A file that grew keeps the bytes the edit was
+    /// built from at its front, so a compare that stops when those bytes run out reports
+    /// an unchanged file and the append is overwritten without a word.
+    #[tokio::test]
+    async fn a_version_guard_rejects_a_file_that_grew_by_a_prefix() {
+        let (path, _dir) = temp_path("prefixguard");
+        let text = path.to_str().unwrap();
+        std::fs::write(text, b"original plus an append\n").unwrap();
+        let err = replace(text, b"edited".to_vec(), Some(b"original".to_vec()))
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("file changed while editing; read it again"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read(text).unwrap(),
+            b"original plus an append\n",
+            "the append had to survive"
+        );
+
+        // An expectation with no bytes is exact too, so a file with bytes in it is not
+        // an empty file.
+        let err = replace(text, b"edited".to_vec(), Some(Vec::new()))
+            .await
+            .unwrap_err();
+        assert!(err.contains("read it again"), "{err}");
+
+        // Bytes that match all the way to the end still pass, and so do no bytes on
+        // either side.
+        std::fs::write(text, b"original").unwrap();
+        replace(text, b"edited".to_vec(), Some(b"original".to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(text).unwrap(), b"edited");
+
+        std::fs::write(text, b"").unwrap();
+        replace(text, b"edited".to_vec(), Some(Vec::new()))
             .await
             .unwrap();
         assert_eq!(std::fs::read(text).unwrap(), b"edited");
