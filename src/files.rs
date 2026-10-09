@@ -290,8 +290,9 @@ fn same_file_version(before: &Metadata, path: &Path) -> bool {
 /// The temporary a replacement is written into, next to the target and named
 /// `<name>.ds4-XXXXXX` so a leftover from either program reads the same.  `tempfile`
 /// supplies the tail, creates the file exclusively, and deletes it if it is dropped
-/// before the rename.  The mode goes to `open` rather than to a later `chmod`, which
-/// would ignore the umask and leave a new file world-writable.
+/// before the rename.  The mode goes to `open` so a brand new file is umasked like any
+/// other new file.  A replacement sets its bits again afterwards, because the umask has
+/// no business changing the bits a file already had.
 fn temp_for(target: &Path, mode: u32) -> Result<NamedTempFile, String> {
     let dir = match target.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
@@ -320,8 +321,8 @@ fn create_new(target: &Path, data: &[u8]) -> Result<NamedTempFile, String> {
     write_temp(target, data, 0o666)
 }
 
-/// Replaces an existing file keeping its owner and permissions.  The temporary is
-/// created with the target's mode, so an executable stays one.
+/// Replaces an existing file keeping its owner and every bit of its mode, so an
+/// executable stays one and a setuid program stays setuid.
 fn copy_metadata(
     source: &File,
     data: &[u8],
@@ -335,6 +336,15 @@ fn copy_metadata(
     let gid = owner.as_ref().map(MetadataExt::gid).unwrap_or(u32::MAX);
     // Only root can hand ownership over.  Losing it is not worth losing the edit.
     unsafe { libc::fchown(temp.as_raw_fd(), uid as libc::uid_t, gid as libc::gid_t) };
+
+    // Neither of the calls that made this file can carry the target's bits.  `open`
+    // masks the mode it is handed with the umask, and a write drops the setuid and
+    // setgid bits.  This is the one that can, and it comes after the write and the
+    // ownership change because both of them clear the bits again.
+    if unsafe { libc::fchmod(temp.as_raw_fd(), mode as libc::mode_t) } != 0 {
+        let err = std::io::Error::last_os_error();
+        return Err(failed(target, &err));
+    }
 
     #[cfg(target_os = "macos")]
     {
@@ -816,22 +826,28 @@ mod tests {
         assert!(!link_was_unsupported(&io::Error::other("no errno at all")));
     }
 
+    /// Every bit of the target's mode survives, not just the ones the umask leaves
+    /// alone.  `open` masks the mode it is handed, and a write clears the setuid and
+    /// setgid bits, so a replacement that only uses those two calls loses what the model
+    /// never asked to lose.
     #[tokio::test]
     async fn the_file_mode_survives_a_replace() {
-        let (path, _dir) = temp_path("mode");
-        let text = path.to_str().unwrap();
-        replace(text, b"#!/bin/sh\n".to_vec(), None).await.unwrap();
-        std::fs::set_permissions(text, std::fs::Permissions::from_mode(0o755)).unwrap();
-        replace(
-            text,
-            b"#!/bin/sh\necho hi\n".to_vec(),
-            Some(b"#!/bin/sh\n".to_vec()),
-        )
-        .await
-        .unwrap();
-        let mode = std::fs::metadata(text).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o755, "mode {mode:o}");
-        std::fs::remove_file(text).unwrap();
+        for mode in [0o755u32, 0o777, 0o640, 0o4755, 0o2755, 0o1755] {
+            let (path, _dir) = temp_path("mode");
+            let text = path.to_str().unwrap();
+            replace(text, b"#!/bin/sh\n".to_vec(), None).await.unwrap();
+            std::fs::set_permissions(text, std::fs::Permissions::from_mode(mode)).unwrap();
+            replace(
+                text,
+                b"#!/bin/sh\necho hi\n".to_vec(),
+                Some(b"#!/bin/sh\n".to_vec()),
+            )
+            .await
+            .unwrap();
+            let got = std::fs::metadata(text).unwrap().permissions().mode() & 0o7777;
+            assert_eq!(got, mode, "a replacement of a file at {mode:o}");
+            std::fs::remove_file(text).unwrap();
+        }
     }
 
     #[tokio::test]
