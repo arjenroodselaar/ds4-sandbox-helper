@@ -106,15 +106,27 @@ itself, line numbers and all. A model should not have to know which side of the
 pipe it is talking to. `bash` keeps jobs running in the background the way the
 agent does, with the same `bash_status` and `bash_stop` follow-ups, and a
 command that will not stop when told is killed along with its process group at
-the end of its deadline. A job also outlives neither the session nor its own
-group. When the run ends, by a closed stdin or by the agent's teardown signal,
+the end of its deadline. `refresh_sec` on all three is how long the helper is
+allowed to take, not how long it takes. The answer goes out the moment the
+command finishes, and only a command still running at the deadline waits that
+long. A job finished by a signal reports `exit_status` as 128+signal, so a
+stopped job reads as 143 or 137.
+
+A job outlives neither the session nor its own group. When the run ends, by a
+closed stdin, by the agent's teardown signal, or by a Ctrl-C at a terminal,
 whatever is still running is asked to stop, given a moment, and then killed
 along with its group, because the agent's signal stops at this process's group
-and a command started here runs in another one. `refresh_sec` on all three is
-how long the helper is allowed to take, not how long it takes. The answer goes
-out the moment the command finishes, and only a command still running at the
-deadline waits that long. A job finished by a signal reports `exit_status` as
-128+signal, so a stopped job reads as 143 or 137.
+and a command started here runs in another one. Both signals ask for the same
+ending rather than taking the helper down where it stands: the agent gives one
+second between SIGTERM and SIGKILL, which is enough for this and not enough to
+wait out a command that ignores the first ask. A signal that arrives while a
+request is being worked on does not drop it either. The request stops waiting,
+answers with what it has, and the session ends afterwards, because an answer the
+agent is waiting for is worth more than a few milliseconds, and a command
+dropped between starting and being recorded is the one thing no later cleanup
+can find. A tool that panics gets the same treatment as a call that fails: the
+model is told, the panic is written to stderr, and the session ends with its
+jobs stopped rather than carrying whatever state the panic left behind.
 
 A request carries with it the caps the helper cannot work out for itself, in a
 `limits` object of its own. The one today is `limits.read_lines`, the size a

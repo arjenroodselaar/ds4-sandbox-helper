@@ -174,6 +174,34 @@ impl Helper {
         reply
     }
 
+    /// Sends a request without waiting for the answer.  A request that is still being
+    /// worked on has no answer to read yet, which is the point of asking for one.
+    async fn send(&mut self, tool: &str, args: serde_json::Value) -> i64 {
+        self.next_id += 1;
+        let id = self.next_id;
+        let payload = serde_json::json!({"id": id, "tool": tool, "args": args}).to_string();
+        self.stdin
+            .write_all(format!("{}\n{payload}", payload.len()).as_bytes())
+            .await
+            .expect("write request");
+        self.stdin.flush().await.expect("flush");
+        id
+    }
+
+    /// The answer to `id`, with a limit on the wait.  A helper that is ending still
+    /// owes an answer to the request it was working on when it was told to end.
+    async fn answer(&mut self, id: i64) -> serde_json::Value {
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(10), self.frame())
+            .await
+            .expect("the helper ended without answering the request that was in flight");
+        assert_eq!(
+            reply["id"].as_i64(),
+            Some(id),
+            "answer to the wrong request: {reply}"
+        );
+        reply
+    }
+
     async fn ok(&mut self, tool: &str, args: serde_json::Value) -> String {
         let reply = self.call(tool, args).await;
         assert!(
@@ -1335,4 +1363,87 @@ async fn a_helper_that_is_signalled_stops_its_jobs_too() {
         !std::path::Path::new(&spool).exists(),
         "spool file left behind: {spool}"
     );
+}
+
+/// Both signals the agent and a terminal use, sent while a tool is waiting.
+///
+/// docs/SANDBOX.md gives the agent one second between SIGTERM and SIGKILL, so a signal
+/// that lands mid-request has to stop the waiting, answer the request, and end on the
+/// way back around.  Dropping the request would answer nothing, and a `bash` call
+/// abandoned between spawning a command and recording it would leave a process group
+/// no job list owns.  The command's child is in the job's group rather than the
+/// helper's, so it only dies if the teardown still runs.
+async fn a_signal_mid_request_answers_and_ends(signal: i32, how: &str) {
+    let mut helper = Helper::start(&[]).await;
+    // The pid is written to a file the test can read, because the answer that would
+    // otherwise carry it, and the spool path inside it, is the thing being held up.
+    let marker = format!(".signal-{how}-mid-request-pid.txt");
+    let _ = std::fs::remove_file(&marker);
+    let id = helper
+        .send(
+            "bash",
+            serde_json::json!({
+                "command": format!("sleep 120 & echo $! > {marker}; echo ready; wait"),
+                "refresh_sec": "30",
+            }),
+        )
+        .await;
+
+    // The signal has to land while the request is inside its wait and the command has
+    // forked, so the pid is waited for rather than assumed.
+    let since = std::time::Instant::now();
+    let child = loop {
+        let text = std::fs::read_to_string(&marker).unwrap_or_default();
+        if let Ok(pid) = text.trim().parse::<u32>() {
+            break pid;
+        }
+        assert!(
+            since.elapsed() < std::time::Duration::from_secs(10),
+            "{how}: the command never forked: {text}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
+    assert!(process_alive(child), "the child died on its own");
+    let _ = std::fs::remove_file(&marker);
+
+    let helper_pid = helper.child.id().expect("the helper has a pid");
+    unsafe { libc::kill(helper_pid as i32, signal) };
+
+    let reply = helper.answer(id).await;
+    assert!(
+        reply["ok"].as_bool() == Some(true),
+        "{how}: the request in flight was not answered: {reply}"
+    );
+    let result = reply["result"].as_str().unwrap_or_default();
+    assert!(
+        result.contains("status=running"),
+        "{how}: unexpected answer to the request in flight: {result}"
+    );
+    let spool = result
+        .lines()
+        .find_map(|line| line.strip_prefix("output_path="))
+        .and_then(|rest| rest.split(" (").next())
+        .expect("an output path");
+
+    // Leaving through a signal is a session that finished, not a fault: the agent's own
+    // teardown counts a helper that dies on SIGTERM as a normal end of run.
+    let status = helper.finish().await;
+    assert!(status.success(), "{how}: the helper left badly: {status}");
+    process_stopped(child, &format!("{how} during a request")).await;
+    assert!(
+        !std::path::Path::new(spool).exists(),
+        "spool file left behind: {spool}"
+    );
+}
+
+#[tokio::test]
+async fn a_termination_during_a_request_is_answered_and_the_jobs_stop() {
+    a_signal_mid_request_answers_and_ends(libc::SIGTERM, "SIGTERM").await;
+}
+
+/// A Ctrl-C at a terminal reaches the helper as well, and its default disposition used
+/// to stop the helper where it stood, with the job groups left running behind it.
+#[tokio::test]
+async fn an_interrupt_during_a_request_is_answered_and_the_jobs_stop() {
+    a_signal_mid_request_answers_and_ends(libc::SIGINT, "SIGINT").await;
 }

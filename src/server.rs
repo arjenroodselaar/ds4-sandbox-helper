@@ -8,14 +8,27 @@
 //! than a multiplexer.  The concurrency a long command needs lives inside the tool.
 //!
 //! Three things end the loop: stdin reaching EOF, a stream that has stopped making
-//! sense, and the agent's teardown signal.  All of them leave through the same session
-//! teardown, because the commands a session started are its own to stop.
+//! sense, and a termination signal, which is SIGTERM from the agent and SIGINT from a
+//! terminal.  All of them leave through the same session teardown, because the commands
+//! a session started are its own to stop.
+//!
+//! A signal that arrives while a request is in flight does not drop it.  The docs give
+//! the agent one second between SIGTERM and SIGKILL, and a request abandoned mid-`bash`
+//! could leave a command between being spawned and being recorded in the job list,
+//! which is the one window no teardown can close.  So the request is told to stop
+//! waiting, answers, and the loop ends on its way back around.
 //!
 //! Anything unreadable ends the session instead of being worked around.  Byte counts
 //! that stopped agreeing with the peer cannot be answered without guessing.
 
 use std::env::current_dir;
+use std::future::Future;
 use std::io::ErrorKind;
+use std::panic::AssertUnwindSafe;
+use std::panic::catch_unwind;
+use std::pin::Pin;
+use std::task::Context;
+use std::task::Poll;
 
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
@@ -25,6 +38,7 @@ use tokio::signal::unix::SignalKind;
 use tokio::signal::unix::signal;
 
 use crate::protocol;
+use crate::protocol::Request;
 use crate::protocol::notice;
 use crate::protocol::response_error;
 use crate::protocol::response_ok;
@@ -87,11 +101,33 @@ where
     // helper.  Answering it is what gives the teardown a chance to stop them.  A
     // helper that cannot catch it keeps the default disposition, and the agent's
     // SIGKILL stays the backstop.
-    let mut terminate = signal(SignalKind::terminate()).ok();
+    let ending = session.ending.clone();
+
+    // The signals are watched by a task of their own, whose only work is to set the
+    // notice.  Waiting for them in the loop below would mean the notice exists only
+    // once the loop is back around to poll it, and a signal that lands while a tool is
+    // waiting would go unnoticed until that tool ran out on its own.  SIGINT is watched
+    // for the same reason as SIGTERM: a Ctrl-C at a terminal reaches this process too,
+    // and its default disposition would stop the helper where it stands, with the job
+    // groups the docs promise to stop still running.
+    {
+        let ending = ending.clone();
+        tokio::spawn(async move {
+            let mut terminate = signal(SignalKind::terminate()).ok();
+            let mut interrupt = signal(SignalKind::interrupt()).ok();
+            tokio::select! {
+                _ = signalled(&mut terminate) => {}
+                _ = signalled(&mut interrupt) => {}
+            }
+            ending.trigger();
+        });
+    }
 
     loop {
+        // A notice already set resolves this at once, which is what ends the session
+        // when the signal landed during a request rather than between two.
         let received = tokio::select! {
-            _ = termination(&mut terminate) => {
+            _ = ending.wait() => {
                 session.finish().await;
                 return Outcome::Finished;
             }
@@ -132,9 +168,19 @@ where
             }
         };
 
-        let reply = match tools::run(&request, &mut session, &config).await {
-            Ok(result) => response_ok(request.id, &result),
-            Err(message) => response_error(request.id, &message),
+        let reply = match run_guarded(&request, &mut session, &config).await {
+            Ok(Ok(result)) => response_ok(request.id, &result),
+            Ok(Err(message)) => response_error(request.id, &message),
+            Err(()) => {
+                // A tool that panicked may have left the session half updated, and
+                // state like that is not worth trusting with the next request.  The
+                // answer still goes out first: losing the call is survivable, losing
+                // both the call and the teardown is what happens today.
+                let reply = response_error(request.id, "the tool panicked, and the session ended");
+                let _ = wire::write_frame(&mut writer, &reply).await;
+                session.finish().await;
+                return Outcome::Fault(format!("the tool panicked in request {}", request.id));
+            }
         };
         // A frame over the limit would be refused outright.  An error keeps the session.
         let reply = if reply.len() > MAX_RESPONSE_BYTES {
@@ -159,6 +205,51 @@ where
                 Outcome::Fault(format!("writing a response: {err}"))
             };
         }
+
+        // The signal arrived while that request was working, and its answer is out.
+        // Waiting for the next frame instead would spend the agent's whole grace on a
+        // read that a tool has already been told to give up on.
+        if ending.triggered() {
+            session.finish().await;
+            return Outcome::Finished;
+        }
+    }
+}
+
+/// One request, with a panic boundary around it.
+///
+/// A panic in a tool unwinds out of the runtime and takes the session with it, which
+/// loses the answer the agent is waiting for.  Catching it at the poll boundary is
+/// what costs no ownership change: `spawn` would need the session moved behind a task,
+/// and that is what lets a request be dropped between spawning a command and recording
+/// it in the job list.
+async fn run_guarded(
+    request: &Request,
+    session: &mut Session,
+    config: &Config,
+) -> Result<Result<String, String>, ()> {
+    Guarded {
+        inner: Box::pin(tools::run(request, session, config)),
+    }
+    .await
+}
+
+/// A future whose panics come out as `Err(())` instead of unwinding the caller.
+struct Guarded<F> {
+    inner: Pin<Box<F>>,
+}
+
+impl<F: Future> Future for Guarded<F> {
+    type Output = Result<F::Output, ()>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // `UnwindSafe` is asserted, not proven: the future is dropped here rather than
+        // polled again, and the caller ends the session instead of reusing it.
+        match catch_unwind(AssertUnwindSafe(|| self.get_mut().inner.as_mut().poll(cx))) {
+            Ok(Poll::Ready(value)) => Poll::Ready(Ok(value)),
+            Ok(Poll::Pending) => Poll::Pending,
+            Err(_) => Poll::Ready(Err(())),
+        }
     }
 }
 
@@ -168,7 +259,7 @@ where
 /// A `None` means the signal could not be caught, which leaves the default disposition
 /// alone.  This never wakes then, and the closed stdin the agent signals after is what
 /// ends the session, as it would anyway.
-async fn termination(term: &mut Option<Signal>) {
+async fn signalled(term: &mut Option<Signal>) {
     match term {
         Some(signal) => {
             signal.recv().await;
@@ -190,4 +281,27 @@ fn truncate_for_log(payload: &[u8]) -> String {
         quoted.push('…');
     }
     quoted
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_request_that_finishes_comes_back_unchanged() {
+        let done = Guarded {
+            inner: Box::pin(async { 7 }),
+        };
+        assert_eq!(done.await, Ok(7));
+    }
+
+    /// The point of the boundary.  A panic inside a tool stops that call, and not the
+    /// session that was asked to answer it.
+    #[tokio::test]
+    async fn a_request_that_panics_comes_back_as_a_fault() {
+        let loud = Guarded {
+            inner: Box::pin(async { panic!("the tool fell over") }),
+        };
+        assert_eq!(loud.await, Err(()));
+    }
 }

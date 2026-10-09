@@ -38,6 +38,7 @@ use tokio::sync::watch;
 
 use crate::budget::Budget;
 use crate::budget::MAX_TOOL_BYTES;
+use crate::cancel::Cancel;
 use crate::files;
 use crate::protocol::Request;
 
@@ -92,6 +93,10 @@ pub struct Job {
     pub status: watch::Sender<Status>,
     /// The first answer shows the head of the output, later ones the tail.
     pub observed_once: bool,
+    /// The line count the last answer reported.  A session that is ending reuses it
+    /// instead of counting the spool again, because counting is the long part of an
+    /// answer and the teardown window is one second.
+    pub last_lines: Option<usize>,
 }
 
 impl Job {
@@ -136,7 +141,12 @@ impl Jobs {
 /// Starts a command and reports the first snapshot, waiting at most `refresh_sec` for
 /// a command that finishes quickly.  The shell is the one settled on at startup.  A
 /// model that could name an interpreter would eventually name one that is not there.
-pub async fn start(request: &Request, jobs: &mut Jobs, shell: &Path) -> Result<String, String> {
+pub async fn start(
+    request: &Request,
+    jobs: &mut Jobs,
+    shell: &Path,
+    ending: &Cancel,
+) -> Result<String, String> {
     let Some(command) = request.arg("command").filter(|c| !c.is_empty()) else {
         return Err("bash requires command".into());
     };
@@ -240,11 +250,12 @@ pub async fn start(request: &Request, jobs: &mut Jobs, shell: &Path) -> Result<S
         timeout_sec: timeout,
         status: sender,
         observed_once: false,
+        last_lines: None,
     });
     let index = jobs.list.len() - 1;
 
-    wait_for(&mut jobs.list[index], Duration::from_secs(refresh)).await;
-    let text = observation(&mut jobs.list[index]).await;
+    wait_for(&mut jobs.list[index], Duration::from_secs(refresh), ending).await;
+    let text = observation(&mut jobs.list[index], ending).await;
     if !jobs.list[index].status().is_running() {
         jobs.remove(id).await;
     }
@@ -252,26 +263,30 @@ pub async fn start(request: &Request, jobs: &mut Jobs, shell: &Path) -> Result<S
 }
 
 /// Reports on a job, waiting up to `refresh_sec` for it to change state first.
-pub async fn status_tool(request: &Request, jobs: &mut Jobs) -> Result<String, String> {
+pub async fn status_tool(
+    request: &Request,
+    jobs: &mut Jobs,
+    ending: &Cancel,
+) -> Result<String, String> {
     let (id, pid) = requested_job(request);
     let Some(index) = jobs.find_index(id, pid) else {
         return Err(format!("bash job not found: job={id} pid={pid}"));
     };
     let refresh = request.arg_or("refresh_sec", 0, 0, 3600) as u64;
     if refresh > 0 {
-        wait_for(&mut jobs.list[index], Duration::from_secs(refresh)).await;
+        wait_for(&mut jobs.list[index], Duration::from_secs(refresh), ending).await;
     }
     // A caller that named the job by pid asked for no job number.  Removing by that
     // number would leave the finished job on the list and its spool file on the disk.
     let found = jobs.list[index].id;
-    let text = observation(&mut jobs.list[index]).await;
+    let text = observation(&mut jobs.list[index], ending).await;
     if !jobs.list[index].status().is_running() {
         jobs.remove(found).await;
     }
     Ok(text)
 }
 
-pub async fn stop(request: &Request, jobs: &mut Jobs) -> Result<String, String> {
+pub async fn stop(request: &Request, jobs: &mut Jobs, ending: &Cancel) -> Result<String, String> {
     let (id, pid) = requested_job(request);
     let Some(index) = jobs.find_index(id, pid) else {
         return Err(format!("bash job not found: job={id} pid={pid}"));
@@ -288,16 +303,16 @@ pub async fn stop(request: &Request, jobs: &mut Jobs) -> Result<String, String> 
     if jobs.list[index].status().is_running() {
         let pid = jobs.list[index].pid;
         kill_group(pid, libc::SIGTERM);
-        wait_for(&mut jobs.list[index], STOP_GRACE).await;
+        wait_for(&mut jobs.list[index], STOP_GRACE, ending).await;
         if jobs.list[index].status().is_running() {
             kill_group(pid, libc::SIGKILL);
         }
     }
     // The reaper still has to notice, or the answer would say "running" for a process
     // that is already reaped.
-    wait_for(&mut jobs.list[index], patience).await;
+    wait_for(&mut jobs.list[index], patience, ending).await;
     let found = jobs.list[index].id;
-    let text = observation(&mut jobs.list[index]).await;
+    let text = observation(&mut jobs.list[index], ending).await;
     if !jobs.list[index].status().is_running() {
         jobs.remove(found).await;
     }
@@ -358,16 +373,23 @@ fn exit_status_of(exit: &std::process::ExitStatus) -> i32 {
 }
 
 /// Waits until the job is no longer running, or until `limit` has passed.
-async fn wait_for(job: &mut Job, limit: Duration) {
+/// Waits for the job to end, for at most `limit`, and for no longer than the session
+/// is willing to wait.  The third branch is what answers a teardown inside the
+/// second the agent allows before it escalates to SIGKILL.
+async fn wait_for(job: &mut Job, limit: Duration, ending: &Cancel) {
     if !job.status().is_running() {
         return;
     }
     let mut receiver = job.status.subscribe();
-    let _ = tokio::time::timeout(limit, receiver.wait_for(|s| !s.is_running())).await;
+    tokio::select! {
+        _ = receiver.wait_for(|status| !status.is_running()) => {}
+        _ = tokio::time::sleep(limit) => {}
+        _ = ending.wait() => {}
+    }
 }
 
 /// The snapshot the model sees, in the same fields and order the agent's own output uses.
-async fn observation(job: &mut Job) -> String {
+async fn observation(job: &mut Job, ending: &Cancel) -> String {
     let status = job.status();
     let first = !job.observed_once;
     job.observed_once = true;
@@ -424,9 +446,21 @@ async fn observation(job: &mut Job) -> String {
             // One open serves the line count and the excerpt.  A spool that is there
             // and still cannot be opened is what the sentinel line reports.
             let mut file = File::open(&job.path).await.ok();
-            let lines = match &mut file {
-                Some(file) => count_lines(file).await,
-                None => 0,
+            let lines = match (ending.triggered(), job.last_lines) {
+                // The agent is one second from SIGKILL, and a spool can be large
+                // enough for the count to spend that on its own.  A number from the
+                // last answer keeps the shape of the answer.  A first observation
+                // still counts, because there is nothing to reuse; the fix for that
+                // is a cursor per job, which is a separate change.
+                (true, Some(seen)) => seen,
+                _ => {
+                    let counted = match &mut file {
+                        Some(file) => count_lines(file).await,
+                        None => 0,
+                    };
+                    job.last_lines = Some(counted);
+                    counted
+                }
             };
             if bytes == 0 {
                 let _ = write!(out, "<output>\n</output>\n");

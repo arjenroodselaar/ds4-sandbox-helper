@@ -9,6 +9,7 @@
 
 use std::path::PathBuf;
 
+use crate::cancel::Cancel;
 use crate::protocol::Request;
 
 pub mod bash;
@@ -55,12 +56,13 @@ impl Default for Config {
     }
 }
 
-/// State that lives for the session, not one request: where `more` resumes, and which
-/// shell commands are running.
+/// State that lives for the session, not one request: where `more` resumes, which
+/// shell commands are running, and whether the session has been asked to end.
 #[derive(Default)]
 pub struct Session {
     pub more: Option<read::MoreState>,
     pub jobs: bash::Jobs,
+    pub ending: Cancel,
 }
 
 impl Session {
@@ -115,9 +117,9 @@ pub async fn run(
         "edit" => edit::edit(request, config.edit_upto).await,
         "list" => list::list(request).await,
         "search" => search::search(request).await,
-        "bash" => bash::start(request, &mut session.jobs, &config.shell).await,
-        "bash_status" => bash::status_tool(request, &mut session.jobs).await,
-        "bash_stop" => bash::stop(request, &mut session.jobs).await,
+        "bash" => bash::start(request, &mut session.jobs, &config.shell, &session.ending).await,
+        "bash_status" => bash::status_tool(request, &mut session.jobs, &session.ending).await,
+        "bash_stop" => bash::stop(request, &mut session.jobs, &session.ending).await,
         // The agent answers unknown names itself, so this is a newer agent routing
         // a tool this helper does not have.
         other => Err(format!("unknown tool: {other}")),

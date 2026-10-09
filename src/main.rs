@@ -8,6 +8,7 @@
 //! Diagnostics go to stderr.  The protocol is specified in ds4's docs/SANDBOX.md.
 
 mod budget;
+mod cancel;
 mod files;
 mod protocol;
 mod server;
