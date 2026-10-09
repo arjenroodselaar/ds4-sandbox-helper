@@ -704,6 +704,24 @@ async fn a_request_for_an_unknown_tool_is_answered_not_ignored() {
     helper.finish().await;
 }
 
+/// A frame with no `tool` at all still carries an id, so one frame answers it.  The
+/// fatal list is for frames that cannot be answered at all, and killing the session
+/// here threw away every job the run had over a name.
+#[tokio::test]
+async fn a_request_with_no_tool_is_answered_and_the_session_survives() {
+    let mut helper = Helper::start(&[]).await;
+    let reply = helper.request(serde_json::json!({"args": {}})).await;
+    assert_eq!(reply["ok"].as_bool(), Some(false), "{reply}");
+    assert_eq!(reply["error"], "request has no tool name");
+
+    let ok = helper
+        .ok("bash", serde_json::json!({"command": "true"}))
+        .await;
+    assert!(ok.contains("exit_status=0"), "{ok}");
+
+    helper.finish().await;
+}
+
 #[tokio::test]
 async fn garbage_on_stdin_ends_the_session_with_a_reason() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_ds4-sandbox-helper"))
@@ -856,6 +874,32 @@ async fn a_frame_whose_id_is_not_an_integer_ends_the_session() {
         !status.success(),
         "a request that cannot be answered by id must not exit clean"
     );
+}
+
+/// The agent numbers requests from 1 and keeps `id` 0 for its own notices.  A reader
+/// waiting for another id drops what it gets, so an answer to 0 or below is a frame
+/// nobody will ever match and the sender waits on it.
+#[tokio::test]
+async fn a_request_id_that_cannot_be_answered_ends_the_session() {
+    for payload in [r#"{"id":0,"tool":"list"}"#, r#"{"id":-5,"tool":"list"}"#] {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_ds4-sandbox-helper"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start the helper");
+        let mut stdin = child.stdin.take().unwrap();
+        stdin
+            .write_all(format!("{}\n{}", payload.len(), payload).as_bytes())
+            .await
+            .unwrap();
+        stdin.flush().await.unwrap();
+        let status = child.wait().await.expect("wait");
+        assert!(
+            !status.success(),
+            "a request with no answerable id must not exit clean: {payload}"
+        );
+    }
 }
 
 /// `--chdir` is the only thing that says what a relative path means to this helper,

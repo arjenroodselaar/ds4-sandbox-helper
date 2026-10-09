@@ -120,6 +120,9 @@ pub async fn run(
         "bash" => bash::start(request, &mut session.jobs, &config.shell, &session.ending).await,
         "bash_status" => bash::status_tool(request, &mut session.jobs, &session.ending).await,
         "bash_stop" => bash::stop(request, &mut session.jobs, &session.ending).await,
+        // A frame can arrive with no `tool` at all, and the id is known, so the answer
+        // is one frame rather than a dead session.
+        "" => Err("request has no tool name".to_string()),
         // The agent answers unknown names itself, so this is a newer agent routing
         // a tool this helper does not have.
         other => Err(format!("unknown tool: {other}")),
@@ -142,6 +145,19 @@ mod tests {
     async fn an_unknown_tool_says_which_one() {
         let err = call("teleport", "").await.unwrap_err();
         assert_eq!(err, "unknown tool: teleport");
+    }
+
+    /// A frame with no `tool` has a known id, so it costs that call rather than the
+    /// session.
+    #[tokio::test]
+    async fn a_request_with_no_tool_is_answered() {
+        for payload in [r#"{"id":1,"args":{}}"#, r#"{"id":1,"tool":"","args":{}}"#] {
+            let request = parse_request(payload.as_bytes()).unwrap();
+            let err = run(&request, &mut Session::default(), &Config::default())
+                .await
+                .unwrap_err();
+            assert_eq!(err, "request has no tool name", "{payload}");
+        }
     }
 
     #[tokio::test]

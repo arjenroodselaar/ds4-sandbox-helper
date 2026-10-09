@@ -88,7 +88,6 @@ pub enum ProtocolError {
     NotAnObject,
     MissingId,
     BadId,
-    MissingTool,
 }
 
 impl std::fmt::Display for ProtocolError {
@@ -96,8 +95,7 @@ impl std::fmt::Display for ProtocolError {
         match self {
             ProtocolError::NotAnObject => write!(f, "frame payload is not a JSON object"),
             ProtocolError::MissingId => write!(f, "frame has no numeric id"),
-            ProtocolError::BadId => write!(f, "request id is not an integer"),
-            ProtocolError::MissingTool => write!(f, "request has no tool name"),
+            ProtocolError::BadId => write!(f, "request id is not a positive integer"),
         }
     }
 }
@@ -126,8 +124,19 @@ pub fn parse_request(payload: &[u8]) -> Result<Request, ProtocolError> {
             .ok_or(ProtocolError::BadId)?,
         Some(_) => return Err(ProtocolError::BadId),
     };
-    let Some(Value::String(tool)) = fields.get("tool") else {
-        return Err(ProtocolError::MissingTool);
+    // An id of 0 is the notice channel and a negative id is nothing the agent numbers.
+    // A reader that is waiting for another id drops whatever it gets, so answering would
+    // leave the sender waiting for a frame it can never match.
+    if id <= 0 {
+        return Err(ProtocolError::BadId);
+    }
+    // A name that is missing, empty or not a string is a name nobody knows.  The id is
+    // what routes the answer, so a bad name costs that call and not the session, the
+    // same way a malformed `args` member does.
+    let tool = match fields.get("tool") {
+        Some(Value::String(tool)) => tool.clone(),
+        Some(other) => other.to_string(),
+        None => String::new(),
     };
     // An `args` of the wrong type is an empty one.  The tool answers with its own
     // missing-parameter error, so a malformed member costs that call and not the session.
@@ -250,6 +259,39 @@ mod tests {
             parse_request(br#"{"id":1e30,"tool":"list"}"#),
             Err(ProtocolError::BadId)
         ));
+    }
+
+    /// A request with no usable `tool` still parses.  The answer needs the id, and a
+    /// name that is missing or odd costs one call rather than the session.
+    #[test]
+    fn a_request_with_no_tool_name_still_parses() {
+        let request = parse_request(br#"{"id":3,"args":{}}"#).unwrap();
+        assert_eq!(request.id, 3);
+        assert_eq!(request.tool, "");
+
+        // A name that is not a string is kept as its JSON text, the way an `args` value
+        // is, so the answer can name what it refused.
+        let request = parse_request(br#"{"id":3,"tool":5}"#).unwrap();
+        assert_eq!(request.tool, "5");
+    }
+
+    /// The agent numbers requests from 1 and keeps 0 for its own notices, so a request
+    /// at 0 or below has no answer the sender would recognise.
+    #[test]
+    fn a_request_id_of_zero_or_below_is_refused() {
+        assert!(matches!(
+            parse_request(br#"{"id":0,"tool":"list"}"#),
+            Err(ProtocolError::BadId)
+        ));
+        assert!(matches!(
+            parse_request(br#"{"id":-5,"tool":"list"}"#),
+            Err(ProtocolError::BadId)
+        ));
+        assert!(matches!(
+            parse_request(br#"{"id":0.0,"tool":"list"}"#),
+            Err(ProtocolError::BadId)
+        ));
+        assert_eq!(parse_request(br#"{"id":1,"tool":"list"}"#).unwrap().id, 1);
     }
 
     #[test]
