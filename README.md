@@ -112,6 +112,16 @@ command finishes, and only a command still running at the deadline waits that
 long. A job finished by a signal reports `exit_status` as 128+signal, so a
 stopped job reads as 143 or 137.
 
+A started command is a process group and a spool file until someone is told it
+finished. Thirty-two run at once, and a start past that is refused with the number
+in it and a suggestion of which job to stop. A job reported as finished is dropped
+when its answer goes out, since the model has seen the output. Thirty-two that
+finished without being reported are released by the next start, spool files
+included, which bounds the pile a model leaves when it moves on. A spool past a
+gigabyte adds a line to the answer. Nothing here stops a command from writing, and
+killing a talkative build is a worse answer than the one the model can act on, so
+the line points at a file of its own or at `bash_stop`.
+
 A job outlives neither the session nor its own group. When the run ends, by a
 closed stdin, by the agent's teardown signal, or by a Ctrl-C at a terminal,
 whatever is still running is asked to stop, given a moment, and then killed
@@ -127,6 +137,13 @@ dropped between starting and being recorded is the one thing no later cleanup
 can find. A tool that panics gets the same treatment as a call that fails: the
 model is told, the panic is written to stderr, and the session ends with its
 jobs stopped rather than carrying whatever state the panic left behind.
+
+A SIGKILL aimed at the helper itself is the one thing none of that covers. There is
+nothing left to run when a process is killed outright, so its commands keep running
+in their own groups and their spool files stay where they were made. Whoever owns
+the container reaps them, the same party that reaps a temp directory. The helper
+only promises what it can catch, which is why its teardown fits inside the agent's
+one second rather than being polite about a long command.
 
 A request carries with it the caps the helper cannot work out for itself, in a
 `limits` object of its own. The one today is `limits.read_lines`, the size a

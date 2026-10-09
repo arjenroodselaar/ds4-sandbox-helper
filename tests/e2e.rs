@@ -1144,6 +1144,93 @@ async fn a_status_that_is_asked_to_wait_answers_with_the_finished_job() {
     helper.finish().await;
 }
 
+/// A spool that grew between two answers is counted from where the first one stopped.
+/// A count that started over would report the early lines twice.
+#[tokio::test]
+async fn a_long_job_counts_only_what_was_appended_since_the_last_answer() {
+    let mut helper = Helper::start(&[]).await;
+    // `refresh_sec` holds the first answer long enough for the first block to have
+    // arrived, and no longer.
+    let started = helper
+        .ok(
+            "bash",
+            serde_json::json!({
+                "command": "seq 1 5000; sleep 1; seq 5001 5003; sleep 30",
+                "refresh_sec": "1",
+            }),
+        )
+        .await;
+    assert!(started.contains("status=running"), "{started}");
+    assert!(started.contains("<head -100 "), "{started}");
+    let job = job_field(&started, "job=");
+
+    // Both blocks are written, and the command is still asleep.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    let later = helper
+        .ok("bash_status", serde_json::json!({"job": job}))
+        .await;
+    assert!(later.contains("status=running"), "{later}");
+    assert!(later.contains(", 5003 lines)"), "{later}");
+    let tail: Vec<&str> = later
+        .lines()
+        .skip_while(|line| !line.starts_with("<tail -4 "))
+        .skip(1)
+        .take_while(|line| *line != "</tail>")
+        .collect();
+    assert_eq!(tail, ["5000", "5001", "5002", "5003"], "{later}");
+
+    helper.finish().await;
+}
+
+/// The limit on running commands reaches the model as an answer, and stopping one is
+/// the way out that answer names.
+///
+/// Ignored because a `bash` answer waits a second at the least for a command still
+/// running, so filling the cap over the wire costs about half a minute.  The rules are
+/// unit tested against a list built by hand.  `cargo test --test e2e -- --ignored`.
+#[tokio::test]
+#[ignore = "fills the running-command cap over the wire, which takes about 32 s"]
+async fn a_command_is_refused_once_too_many_are_running() {
+    let mut helper = Helper::start(&[]).await;
+    let mut jobs = Vec::new();
+    for _ in 0..32 {
+        let started = helper
+            .ok(
+                "bash",
+                serde_json::json!({"command": "sleep 300", "refresh_sec": "0"}),
+            )
+            .await;
+        assert!(started.contains("status=running"), "{started}");
+        jobs.push(job_field(&started, "job="));
+    }
+
+    let refused = helper
+        .fail("bash", serde_json::json!({"command": "echo no room"}))
+        .await;
+    assert!(
+        refused.contains("32 bash commands are already running"),
+        "{refused}"
+    );
+    assert!(refused.contains("bash_stop"), "{refused}");
+
+    let stopped = helper
+        .ok(
+            "bash_stop",
+            serde_json::json!({"job": jobs[0], "refresh_sec": "5"}),
+        )
+        .await;
+    assert!(stopped.contains("status=done"), "{stopped}");
+    let after = helper
+        .ok(
+            "bash",
+            serde_json::json!({"command": "echo room", "refresh_sec": "5"}),
+        )
+        .await;
+    assert!(after.contains("room"), "{after}");
+
+    helper.finish().await;
+}
+
 /// A command that ends while no request is watching it still has to be reported as
 /// ended.  Its status arrives with no receiver, and the next ask has to see it.
 #[tokio::test]

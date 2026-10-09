@@ -61,6 +61,16 @@ const STOP_WAIT: Duration = Duration::from_secs(5);
 /// to fit inside a second.  A job that needs longer is killed rather than waited out.
 const TEARDOWN_GRACE: Duration = Duration::from_millis(400);
 
+/// How many commands may run at once.  Each one is a process group and a spool file
+/// that outlives the request that started it.
+const MAX_LIVE_JOBS: usize = 32;
+/// How many finished jobs stay listed for a `bash_status` to ask about.  Each holds a
+/// spool file, and one that is never asked about is never reported.
+const MAX_UNREPORTED_JOBS: usize = 32;
+/// The spool size worth saying something about.  Nothing here stops a command from
+/// writing, so the only answer is to tell the model its disk is going.
+const SPOOL_NOTICE_BYTES: u64 = 1 << 30;
+
 /// What the watcher task knows about a job, cloned into every observation.  Only a
 /// reaped job has an exit status, so the ended state is what carries those fields.
 #[derive(Debug, Clone, Default)]
@@ -84,6 +94,25 @@ impl Status {
     }
 }
 
+/// What one line count covered.
+///
+/// A command appends and never rewrites, so everything below `offset` is settled.
+/// `open` is the state of the byte at `offset - 1`, because an append can finish the
+/// line that byte started.
+#[derive(Debug, Clone, Copy)]
+struct Count {
+    offset: u64,
+    newlines: usize,
+    open: bool,
+}
+
+impl Count {
+    /// The number an answer reports, counting a trailing partial line as one.
+    fn lines(self) -> usize {
+        self.newlines + usize::from(self.open)
+    }
+}
+
 pub struct Job {
     pub id: i32,
     pub pid: u32,
@@ -93,10 +122,9 @@ pub struct Job {
     pub status: watch::Sender<Status>,
     /// The first answer shows the head of the output, later ones the tail.
     pub observed_once: bool,
-    /// The line count the last answer reported.  A session that is ending reuses it
-    /// instead of counting the spool again, because counting is the long part of an
-    /// answer and the teardown window is one second.
-    pub last_lines: Option<usize>,
+    /// The count the last answer reported and how much of the spool it read.  Private
+    /// because it is how an answer is made cheap, not something the job reports.
+    counted: Option<Count>,
 }
 
 impl Job {
@@ -128,6 +156,29 @@ impl Jobs {
         })
     }
 
+    /// Commands still running.  A finished job stays listed until an answer reports it,
+    /// so this is not the list length.
+    fn running(&self) -> usize {
+        self.list
+            .iter()
+            .filter(|job| job.status().is_running())
+            .count()
+    }
+
+    /// Releases every finished job and its spool.  Called only when the pile is big
+    /// enough to matter, so an unasked-about job keeps its output while there is room.
+    async fn release_finished(&mut self) {
+        let finished: Vec<i32> = self
+            .list
+            .iter()
+            .filter(|job| !job.status().is_running())
+            .map(|job| job.id)
+            .collect();
+        for id in finished {
+            self.remove(id).await;
+        }
+    }
+
     async fn remove(&mut self, id: i32) {
         // A finished job's spool file goes with it.  The agent has already seen the
         // output, and /tmp is not this process's to keep.
@@ -136,6 +187,24 @@ impl Jobs {
             let _ = tokio::fs::remove_file(&job.path).await;
         }
     }
+}
+
+/// What the two limits say about a start.  A pile of finished jobs is released, and a
+/// start that would run past the cap is refused.
+///
+/// Both rules are here rather than inline in `start` because a `bash` answer waits a
+/// second at the least for a command still running, so filling the cap over the wire
+/// costs a second per slot.
+async fn make_room(jobs: &mut Jobs) -> Result<(), String> {
+    if jobs.list.len() - jobs.running() >= MAX_UNREPORTED_JOBS {
+        jobs.release_finished().await;
+    }
+    if jobs.running() >= MAX_LIVE_JOBS {
+        return Err(format!(
+            "{MAX_LIVE_JOBS} bash commands are already running, the most at a time. Stop one with bash_stop or wait for one to end"
+        ));
+    }
+    Ok(())
 }
 
 /// Starts a command and reports the first snapshot, waiting at most `refresh_sec` for
@@ -158,6 +227,8 @@ pub async fn start(
         .unwrap_or(DEFAULT_TIMEOUT_SEC)
         .min(MAX_TIMEOUT_SEC);
     let refresh = request.arg_or("refresh_sec", 60, 1, 3600) as u64;
+
+    make_room(jobs).await?;
 
     if jobs.next_id <= 0 {
         jobs.next_id = 1;
@@ -250,7 +321,7 @@ pub async fn start(
         timeout_sec: timeout,
         status: sender,
         observed_once: false,
-        last_lines: None,
+        counted: None,
     });
     let index = jobs.list.len() - 1;
 
@@ -446,22 +517,18 @@ async fn observation(job: &mut Job, ending: &Cancel) -> String {
             // One open serves the line count and the excerpt.  A spool that is there
             // and still cannot be opened is what the sentinel line reports.
             let mut file = File::open(&job.path).await.ok();
-            let lines = match (ending.triggered(), job.last_lines) {
-                // The agent is one second from SIGKILL, and a spool can be large
-                // enough for the count to spend that on its own.  A number from the
-                // last answer keeps the shape of the answer.  A first observation
-                // still counts, because there is nothing to reuse; the fix for that
-                // is a cursor per job, which is a separate change.
-                (true, Some(seen)) => seen,
-                _ => {
-                    let counted = match &mut file {
-                        Some(file) => count_lines(file).await,
-                        None => 0,
-                    };
-                    job.last_lines = Some(counted);
-                    counted
-                }
+            // The count reads only what the last one had not seen.  A session that is
+            // ending skips even that tail, since the agent is one second from SIGKILL
+            // and a first count of a large spool can spend it.
+            let counting = match (ending.triggered(), job.counted) {
+                (true, Some(seen)) => Some(seen),
+                (_, seen) => match &mut file {
+                    Some(file) => Some(count_from(file, seen).await),
+                    None => seen,
+                },
             };
+            job.counted = counting;
+            let lines = counting.map_or(0, Count::lines);
             if bytes == 0 {
                 let _ = write!(out, "<output>\n</output>\n");
             } else if first {
@@ -506,6 +573,9 @@ async fn observation(job: &mut Job, ending: &Cancel) -> String {
                 }
                 let _ = writeln!(out, "</tail>");
             }
+            if let Some(notice) = spool_notice(running, bytes) {
+                let _ = writeln!(out, "{notice}");
+            }
         }
     }
 
@@ -517,6 +587,17 @@ async fn observation(job: &mut Job, ending: &Cancel) -> String {
         );
     }
     out.into_string()
+}
+
+/// The sentence a running answer gains past [`SPOOL_NOTICE_BYTES`], and nothing below
+/// it.  Bracketed like the byte-limit note, because it is advice for the next command.
+/// A finished job is not told, since the answer that reports it finished is followed by
+/// the spool being deleted.  Out of `observation` so the boundary is testable.
+fn spool_notice(running: bool, bytes: u64) -> Option<String> {
+    (running && bytes >= SPOOL_NOTICE_BYTES).then(|| {
+        "[Output is past 1 GiB in the spool. Send further output to a file of your own, or stop the job with bash_stop.]"
+            .to_string()
+    })
 }
 
 /// The file a job's output is spooled into, named `ds4_agent_output_XXXXXX` like the
@@ -569,30 +650,43 @@ impl Drop for GroupKill {
     }
 }
 
-/// Newlines plus one for a trailing partial line.  Streamed, because a command can
-/// write more than memory.
-async fn count_lines(file: &mut File) -> usize {
-    let mut lines = 0usize;
-    let mut last = None;
+/// Newlines plus one for a trailing partial line, counting only the bytes past `seen`.
+/// Streamed, because a command can write more than memory.
+async fn count_from(file: &mut File, seen: Option<Count>) -> Count {
+    let mut count = seen.unwrap_or(Count {
+        offset: 0,
+        newlines: 0,
+        open: false,
+    });
+    // Shorter than the cursor means the file was rewritten, which a command can do to
+    // its own spool.  Only a count from the start is right then.
+    if file
+        .metadata()
+        .await
+        .is_ok_and(|meta| meta.len() < count.offset)
+    {
+        count = Count {
+            offset: 0,
+            newlines: 0,
+            open: false,
+        };
+    }
+    if count.offset > 0 && file.seek(SeekFrom::Start(count.offset)).await.is_err() {
+        return count;
+    }
     let mut buf = vec![0u8; 64 * 1024];
     loop {
         match file.read(&mut buf).await {
             Ok(0) => break,
             Ok(n) => {
-                for byte in &buf[..n] {
-                    if *byte == b'\n' {
-                        lines += 1;
-                    }
-                }
-                last = Some(buf[n - 1]);
+                count.newlines += buf[..n].iter().filter(|byte| **byte == b'\n').count();
+                count.open = buf[n - 1] != b'\n';
+                count.offset += n as u64;
             }
             Err(_) => break,
         }
     }
-    if last.is_some_and(|byte| byte != b'\n') {
-        lines += 1;
-    }
-    lines
+    count
 }
 
 /// The first lines of the output, capped at [`HEAD_BYTES`].  Reports what stopped
@@ -683,6 +777,185 @@ async fn read_tail(file: &mut File, want: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use tokio::io::AsyncWriteExt;
+
+    /// A spool with some output already in it.
+    async fn spool(path: &Path, text: &str) {
+        tokio::fs::write(path, text).await.unwrap();
+    }
+
+    async fn append(path: &Path, text: &str) {
+        let mut file = tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .await
+            .unwrap();
+        file.write_all(text.as_bytes()).await.unwrap();
+    }
+
+    async fn opened(path: &Path) -> File {
+        tokio::fs::File::open(path).await.unwrap()
+    }
+
+    /// A count from byte zero, which a continued count has to agree with.
+    async fn whole(file: &mut File) -> Count {
+        count_from(file, None).await
+    }
+
+    /// A slot in the list rather than a command, running or ended, with a spool path
+    /// that was never made.
+    fn slot(id: i32, running: bool) -> Job {
+        let status = if running {
+            Status::Running
+        } else {
+            Status::Done {
+                exit_status: 0,
+                timed_out: false,
+                output_error: None,
+                ended_at: Instant::now(),
+            }
+        };
+        let (sender, _receiver) = watch::channel(status);
+        Job {
+            id,
+            pid: 0,
+            path: PathBuf::from(format!("/tmp/ds4-helper-slot-{id}")),
+            started: Instant::now(),
+            timeout_sec: 1.0,
+            status: sender,
+            observed_once: false,
+            counted: None,
+        }
+    }
+
+    fn listed(running: usize, finished: usize) -> Jobs {
+        let mut jobs = Jobs::default();
+        for id in 1..=(running + finished) {
+            jobs.list.push(slot(id as i32, id <= running));
+        }
+        jobs
+    }
+
+    /// The cap counts running commands, and the refusal names the way out.  A finished
+    /// command holds a spool file, not a slot.
+    #[tokio::test]
+    async fn the_cap_counts_commands_that_are_running() {
+        let refused = make_room(&mut listed(MAX_LIVE_JOBS, 0)).await.unwrap_err();
+        assert!(
+            refused.contains("32 bash commands are already running"),
+            "{refused}"
+        );
+        assert!(refused.contains("bash_stop"), "{refused}");
+        // A formatter that folds a line continuation into a literal leaves a run of
+        // spaces where the sentence broke, and only an answer reads that back.
+        assert!(
+            !refused.contains("  "),
+            "double space in the refusal: {refused}"
+        );
+
+        // One short of the cap is one short of the refusal.
+        let mut room = listed(MAX_LIVE_JOBS - 1, MAX_UNREPORTED_JOBS - 1);
+        make_room(&mut room).await.unwrap();
+        assert_eq!(room.running(), MAX_LIVE_JOBS - 1);
+        assert_eq!(room.list.len(), MAX_LIVE_JOBS + MAX_UNREPORTED_JOBS - 2);
+    }
+
+    /// Finished jobs keep their answers until enough pile up.  Releasing them cannot
+    /// free a slot, because they never took one.
+    #[tokio::test]
+    async fn a_pile_of_finished_jobs_is_released_by_the_next_start() {
+        let mut kept = listed(1, MAX_UNREPORTED_JOBS - 1);
+        make_room(&mut kept).await.unwrap();
+        assert_eq!(kept.list.len(), MAX_UNREPORTED_JOBS);
+
+        let mut piled = listed(1, MAX_UNREPORTED_JOBS);
+        make_room(&mut piled).await.unwrap();
+        assert_eq!(piled.list.len(), 1);
+
+        let mut both = listed(MAX_LIVE_JOBS, MAX_UNREPORTED_JOBS);
+        let refused = make_room(&mut both).await.unwrap_err();
+        assert!(refused.contains("already running"), "{refused}");
+        assert_eq!(both.list.len(), MAX_LIVE_JOBS);
+    }
+
+    /// The notice waits for the ceiling, and a finished job is not told.
+    #[test]
+    fn the_spool_notice_waits_for_the_ceiling() {
+        assert!(spool_notice(true, SPOOL_NOTICE_BYTES - 1).is_none());
+        let notice = spool_notice(true, SPOOL_NOTICE_BYTES).unwrap();
+        assert!(notice.contains("bash_stop"), "{notice}");
+        assert!(
+            !notice.contains("  "),
+            "double space in the notice: {notice}"
+        );
+        assert!(spool_notice(false, 4 * SPOOL_NOTICE_BYTES).is_none());
+    }
+
+    /// A continued count gives the number the whole file deserves.  A rescan from the
+    /// start would add the earlier newlines twice, so these assertions are the
+    /// tail-only scan and not only its result.
+    #[tokio::test]
+    async fn a_count_continues_where_the_last_one_stopped() {
+        let dir = tempfile::TempDir::with_prefix("ds4-helper-count-").unwrap();
+        let path = dir.path().join("out");
+        spool(&path, "").await;
+
+        let mut seen = None;
+        for chunk in ["one\ntwo\n", "three\nfo", "ur\nfive\n", "six"] {
+            append(&path, chunk).await;
+            let mut file = opened(&path).await;
+            let count = count_from(&mut file, seen).await;
+            let mut again = opened(&path).await;
+            let fresh = whole(&mut again).await;
+            assert_eq!(count.lines(), fresh.lines(), "after {chunk:?}");
+            assert_eq!(count.offset, fresh.offset, "after {chunk:?}");
+            seen = Some(count);
+        }
+
+        // Five lines and the "six" with no newline yet.
+        assert_eq!(seen.unwrap().lines(), 6);
+    }
+
+    /// An append can finish a line an earlier count saw unfinished.  That line was
+    /// already counted once.
+    #[tokio::test]
+    async fn a_line_finished_by_a_later_append_is_not_counted_twice() {
+        let dir = tempfile::TempDir::with_prefix("ds4-helper-partial-").unwrap();
+        let path = dir.path().join("out");
+        spool(&path, "half a line").await;
+        let mut file = opened(&path).await;
+        let seen = count_from(&mut file, None).await;
+        assert_eq!(seen.lines(), 1);
+
+        append(&path, " and the rest\n").await;
+        let mut file = opened(&path).await;
+        let seen = count_from(&mut file, Some(seen)).await;
+        assert_eq!(seen.lines(), 1);
+
+        append(&path, "a new one").await;
+        let mut file = opened(&path).await;
+        let seen = count_from(&mut file, Some(seen)).await;
+        assert_eq!(seen.lines(), 2);
+    }
+
+    /// A command can truncate its own output file.  A cursor past the end would report
+    /// lines that are gone, so a shorter spool is counted from the start.
+    #[tokio::test]
+    async fn a_spool_that_got_shorter_is_counted_from_the_start() {
+        let dir = tempfile::TempDir::with_prefix("ds4-helper-shrink-").unwrap();
+        let path = dir.path().join("out");
+        spool(&path, "one\ntwo\nthree\n").await;
+        let mut file = opened(&path).await;
+        let seen = count_from(&mut file, None).await;
+        assert_eq!(seen.lines(), 3);
+
+        spool(&path, "ab").await;
+        let mut file = opened(&path).await;
+        let count = count_from(&mut file, Some(seen)).await;
+        assert_eq!(count.lines(), 1);
+        assert_eq!(count.offset, 2);
+    }
 
     async fn tail_of(dir: &Path, text: &str, want: usize) -> String {
         let path = dir.join("out");
